@@ -1,0 +1,12 @@
+# .gitignore
+*.exe*
+*.lib
+*.obj
+*.a
+*.dll
+*.s
+*.o
+include/**
+quickjs-*.zip
+qjscalc.c
+repl.c
