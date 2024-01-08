@@ -69,6 +69,11 @@ options then run @code{make}.
 You can type @code{make install} as root if you wish to install the binaries and support files to
 @code{/usr/local} (this is not necessary to use QuickJS).
 
+Note: On some OSes atomic operations are not available or need a
+specific library. If you get related errors, you should either add
+@code{-latomics} in the Makefile @code{LIBS} variable or disable
+@code{CONFIG_ATOMICS} in @file{quickjs.c}.
+
 @section Quick start
 
 @code{qjs} is the command line interpreter (Read-Eval-Print Loop). You can pass
@@ -368,6 +373,9 @@ optional properties:
   @item backtrace_barrier
   Boolean (default = false). If true, error backtraces do not list the
   stack frames below the evalScript.
+  @item async
+  Boolean (default = false). If true, @code{await} is accepted in the
+  script and a promise is returned.
   @end table
 
 @item loadScript(filename)
@@ -768,6 +776,17 @@ write_fd]} or null in case of error.
 
 @item sleep(delay_ms)
 Sleep during @code{delay_ms} milliseconds.
+
+@item sleepAsync(delay_ms)
+Asynchronouse sleep during @code{delay_ms} milliseconds. Returns a promise. Example:
+@example
+await os.sleepAsync(500);
+@end example
+
+@item now()
+Return a timestamp in milliseconds with more precision than
+@code{Date.now()}. The time origin is unspecified and is normally not
+impacted by system clock adjustments.
 
 @item setTimeout(func, delay)
 Call the function @code{func} after @code{delay} ms. Return a handle

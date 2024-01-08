@@ -52,7 +52,7 @@ prefix=/usr/local
 #CONFIG_PROFILE=y
 # use address sanitizer
 #CONFIG_ASAN=y
-# include the code for BigInt/BigFloat/BigDecimal and math mode
+# include the code for BigFloat/BigDecimal, math mode and faster large integers
 CONFIG_BIGNUM=y
 
 OBJDIR=.obj
@@ -101,6 +101,7 @@ else
   endif
 endif
 STRIP=$(CROSS_PREFIX)strip
+CFLAGS+=-fwrapv # ensure that signed overflows behave as expected
 ifdef CONFIG_WERROR
 CFLAGS+=-Werror
 endif
@@ -162,10 +163,9 @@ endif
 
 # examples
 ifeq ($(CROSS_PREFIX),)
-ifdef CONFIG_ASAN
-PROGS+=
-else
-PROGS+=examples/hello examples/hello_module examples/test_fib
+PROGS+=examples/hello
+ifndef CONFIG_ASAN
+PROGS+=examples/hello_module examples/test_fib
 ifndef CONFIG_DARWIN
 PROGS+=examples/fib.so examples/point.so
 endif
@@ -174,11 +174,10 @@ endif
 
 all: $(OBJDIR) $(OBJDIR)/quickjs.check.o $(OBJDIR)/qjs.check.o $(PROGS)
 
-QJS_LIB_OBJS=$(OBJDIR)/quickjs.o $(OBJDIR)/libregexp.o $(OBJDIR)/libunicode.o $(OBJDIR)/cutils.o $(OBJDIR)/quickjs-libc.o
+QJS_LIB_OBJS=$(OBJDIR)/quickjs.o $(OBJDIR)/libregexp.o $(OBJDIR)/libunicode.o $(OBJDIR)/cutils.o $(OBJDIR)/quickjs-libc.o $(OBJDIR)/libbf.o 
 
 QJS_OBJS=$(OBJDIR)/qjs.o $(OBJDIR)/repl.o $(QJS_LIB_OBJS)
 ifdef CONFIG_BIGNUM
-QJS_LIB_OBJS+=$(OBJDIR)/libbf.o 
 QJS_OBJS+=$(OBJDIR)/qjscalc.o
 endif
 
@@ -325,10 +324,7 @@ endif
 HELLO_SRCS=examples/hello.js
 HELLO_OPTS=-fno-string-normalize -fno-map -fno-promise -fno-typedarray \
            -fno-typedarray -fno-regexp -fno-json -fno-eval -fno-proxy \
-           -fno-date -fno-module-loader
-ifdef CONFIG_BIGNUM
-HELLO_OPTS+=-fno-bigint
-endif
+           -fno-date -fno-module-loader -fno-bigint
 
 hello.c: $(QJSC) $(HELLO_SRCS)
 	$(QJSC) -e $(HELLO_OPTS) -o $@ $(HELLO_SRCS)
