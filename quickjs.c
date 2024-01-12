@@ -1692,19 +1692,19 @@ void JS_SetRuntimeOpaque(JSRuntime *rt, void *opaque)
 }
 
 /* default memory allocation functions with memory limitation */
-static inline size_t js_def_malloc_usable_size(void *ptr)
+static size_t js_def_malloc_usable_size(const void *ptr)
 {
 #if defined(__APPLE__)
     return malloc_size(ptr);
 #elif defined(_WIN32)
-    return _msize(ptr);
+    return _msize((void *)ptr);
 #elif defined(EMSCRIPTEN)
     return 0;
 #elif defined(__linux__)
-    return malloc_usable_size(ptr);
+    return malloc_usable_size((void *)ptr);
 #else
     /* change this to `return 0;` if compilation fails */
-    return malloc_usable_size(ptr);
+    return malloc_usable_size((void *)ptr);
 #endif
 }
 
@@ -1768,18 +1768,7 @@ static const JSMallocFunctions def_malloc_funcs = {
     js_def_malloc,
     js_def_free,
     js_def_realloc,
-#if defined(__APPLE__)
-    malloc_size,
-#elif defined(_WIN32)
-    (size_t (*)(const void *))_msize,
-#elif defined(EMSCRIPTEN)
-    NULL,
-#elif defined(__linux__)
-    (size_t (*)(const void *))malloc_usable_size,
-#else
-    /* change this to `NULL,` if compilation fails */
-    malloc_usable_size,
-#endif
+    js_def_malloc_usable_size,
 };
 
 JSRuntime *JS_NewRuntime(void)
@@ -7911,47 +7900,45 @@ static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
     if (likely(JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT &&
                JS_VALUE_GET_TAG(prop) == JS_TAG_INT)) {
         JSObject *p;
-        uint32_t idx, len;
+        uint32_t idx;
         /* fast path for array access */
         p = JS_VALUE_GET_OBJ(this_obj);
         idx = JS_VALUE_GET_INT(prop);
-        /* Note: this code works even if 'p->u.array.count' is not
-           initialized. There are two cases:
-           - 'p' is an array-like object. 'p->u.array.count' is
-             initialized so the slow_path is taken when the index is
-             out of bounds.
-           - 'p' is not an array-like object. 'p->u.array.count' has
-           any value and potentially not initialized. In all the cases
-           (idx >= len or idx < len) the slow path is taken as
-           expected.
-        */
-        len = (uint32_t)p->u.array.count;
-        if (unlikely(idx >= len))
-            goto slow_path;
         switch(p->class_id) {
         case JS_CLASS_ARRAY:
         case JS_CLASS_ARGUMENTS:
+            if (unlikely(idx >= p->u.array.count)) goto slow_path;
             return JS_DupValue(ctx, p->u.array.u.values[idx]);
         case JS_CLASS_INT8_ARRAY:
+            if (unlikely(idx >= p->u.array.count)) goto slow_path;
             return JS_NewInt32(ctx, p->u.array.u.int8_ptr[idx]);
         case JS_CLASS_UINT8C_ARRAY:
         case JS_CLASS_UINT8_ARRAY:
+            if (unlikely(idx >= p->u.array.count)) goto slow_path;
             return JS_NewInt32(ctx, p->u.array.u.uint8_ptr[idx]);
         case JS_CLASS_INT16_ARRAY:
+            if (unlikely(idx >= p->u.array.count)) goto slow_path;
             return JS_NewInt32(ctx, p->u.array.u.int16_ptr[idx]);
         case JS_CLASS_UINT16_ARRAY:
+            if (unlikely(idx >= p->u.array.count)) goto slow_path;
             return JS_NewInt32(ctx, p->u.array.u.uint16_ptr[idx]);
         case JS_CLASS_INT32_ARRAY:
+            if (unlikely(idx >= p->u.array.count)) goto slow_path;
             return JS_NewInt32(ctx, p->u.array.u.int32_ptr[idx]);
         case JS_CLASS_UINT32_ARRAY:
+            if (unlikely(idx >= p->u.array.count)) goto slow_path;
             return JS_NewUint32(ctx, p->u.array.u.uint32_ptr[idx]);
         case JS_CLASS_BIG_INT64_ARRAY:
+            if (unlikely(idx >= p->u.array.count)) goto slow_path;
             return JS_NewBigInt64(ctx, p->u.array.u.int64_ptr[idx]);
         case JS_CLASS_BIG_UINT64_ARRAY:
+            if (unlikely(idx >= p->u.array.count)) goto slow_path;
             return JS_NewBigUint64(ctx, p->u.array.u.uint64_ptr[idx]);
         case JS_CLASS_FLOAT32_ARRAY:
+            if (unlikely(idx >= p->u.array.count)) goto slow_path;
             return __JS_NewFloat64(ctx, p->u.array.u.float_ptr[idx]);
         case JS_CLASS_FLOAT64_ARRAY:
+            if (unlikely(idx >= p->u.array.count)) goto slow_path;
             return __JS_NewFloat64(ctx, p->u.array.u.double_ptr[idx]);
         default:
             goto slow_path;
@@ -20493,6 +20480,48 @@ static __exception int ident_realloc(JSContext *ctx, char **pbuf, size_t *psize,
     return 0;
 }
 
+/* convert a TOK_IDENT to a keyword when needed */
+static void update_token_ident(JSParseState *s)
+{
+    if (s->token.u.ident.atom <= JS_ATOM_LAST_KEYWORD ||
+        (s->token.u.ident.atom <= JS_ATOM_LAST_STRICT_KEYWORD &&
+         (s->cur_func->js_mode & JS_MODE_STRICT)) ||
+        (s->token.u.ident.atom == JS_ATOM_yield &&
+         ((s->cur_func->func_kind & JS_FUNC_GENERATOR) ||
+          (s->cur_func->func_type == JS_PARSE_FUNC_ARROW &&
+           !s->cur_func->in_function_body && s->cur_func->parent &&
+           (s->cur_func->parent->func_kind & JS_FUNC_GENERATOR)))) ||
+        (s->token.u.ident.atom == JS_ATOM_await &&
+         (s->is_module ||
+          (s->cur_func->func_kind & JS_FUNC_ASYNC) ||
+          s->cur_func->func_type == JS_PARSE_FUNC_CLASS_STATIC_INIT ||
+          (s->cur_func->func_type == JS_PARSE_FUNC_ARROW &&
+           !s->cur_func->in_function_body && s->cur_func->parent &&
+           ((s->cur_func->parent->func_kind & JS_FUNC_ASYNC) ||
+            s->cur_func->parent->func_type == JS_PARSE_FUNC_CLASS_STATIC_INIT))))) {
+        if (s->token.u.ident.has_escape) {
+            s->token.u.ident.is_reserved = TRUE;
+            s->token.val = TOK_IDENT;
+        } else {
+            /* The keywords atoms are pre allocated */
+            s->token.val = s->token.u.ident.atom - 1 + TOK_FIRST_KEYWORD;
+        }
+    }
+}
+
+/* if the current token is an identifier or keyword, reparse it
+   according to the current function type */
+static void reparse_ident_token(JSParseState *s)
+{
+    if (s->token.val == TOK_IDENT ||
+        (s->token.val >= TOK_FIRST_KEYWORD &&
+         s->token.val <= TOK_LAST_KEYWORD)) {
+        s->token.val = TOK_IDENT;
+        s->token.u.ident.is_reserved = FALSE;
+        update_token_ident(s);
+    }
+}
+
 /* 'c' is the first character. Return JS_ATOM_NULL in case of error */
 static JSAtom parse_ident(JSParseState *s, const uint8_t **pp,
                           BOOL *pident_has_escape, int c, BOOL is_private)
@@ -20699,32 +20728,8 @@ static __exception int next_token(JSParseState *s)
         s->token.u.ident.atom = atom;
         s->token.u.ident.has_escape = ident_has_escape;
         s->token.u.ident.is_reserved = FALSE;
-        if (s->token.u.ident.atom <= JS_ATOM_LAST_KEYWORD ||
-            (s->token.u.ident.atom <= JS_ATOM_LAST_STRICT_KEYWORD &&
-             (s->cur_func->js_mode & JS_MODE_STRICT)) ||
-            (s->token.u.ident.atom == JS_ATOM_yield &&
-             ((s->cur_func->func_kind & JS_FUNC_GENERATOR) ||
-              (s->cur_func->func_type == JS_PARSE_FUNC_ARROW &&
-               !s->cur_func->in_function_body && s->cur_func->parent &&
-               (s->cur_func->parent->func_kind & JS_FUNC_GENERATOR)))) ||
-            (s->token.u.ident.atom == JS_ATOM_await &&
-             (s->is_module ||
-              (s->cur_func->func_kind & JS_FUNC_ASYNC) ||
-              s->cur_func->func_type == JS_PARSE_FUNC_CLASS_STATIC_INIT ||
-              (s->cur_func->func_type == JS_PARSE_FUNC_ARROW &&
-               !s->cur_func->in_function_body && s->cur_func->parent &&
-               ((s->cur_func->parent->func_kind & JS_FUNC_ASYNC) ||
-                s->cur_func->parent->func_type == JS_PARSE_FUNC_CLASS_STATIC_INIT))))) {
-            if (ident_has_escape) {
-                s->token.u.ident.is_reserved = TRUE;
-                s->token.val = TOK_IDENT;
-            } else {
-                /* The keywords atoms are pre allocated */
-                s->token.val = s->token.u.ident.atom - 1 + TOK_FIRST_KEYWORD;
-            }
-        } else {
-            s->token.val = TOK_IDENT;
-        }
+        s->token.val = TOK_IDENT;
+        update_token_ident(s);
         break;
     case '#':
         /* private name */
@@ -21518,6 +21523,14 @@ static int new_label_fd(JSFunctionDef *fd, int label)
 static int new_label(JSParseState *s)
 {
     return new_label_fd(s->cur_func, -1);
+}
+
+/* don't update the last opcode and don't emit line number info */
+static void emit_label_raw(JSParseState *s, int label)
+{
+    emit_u8(s, OP_label);
+    emit_u32(s, label);
+    s->cur_func->label_slots[label].pos = s->cur_func->byte_code.size;
 }
 
 /* return the label ID offset */
@@ -22959,14 +22972,6 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 emit_atom(s, JS_ATOM_this);
                 emit_u16(s, 0);
                 // stack is now: fclosure this
-                /* XXX: should do it only once */
-                if (class_name != JS_ATOM_NULL) {
-                    // TODO(bnoordhuis) pass as argument to init method?
-                    emit_op(s, OP_dup);
-                    emit_op(s, OP_scope_put_var_init);
-                    emit_atom(s, class_name);
-                    emit_u16(s, s->cur_func->scope_level);
-                }
                 emit_op(s, OP_swap);
                 // stack is now: this fclosure
                 emit_op(s, OP_call_method);
@@ -23287,6 +23292,16 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
         emit_op(s, OP_add_brand);
     }
 
+    if (class_name != JS_ATOM_NULL) {
+        /* store the class name in the scoped class name variable (it
+           is independent from the class statement variable
+           definition) */
+        emit_op(s, OP_dup);
+        emit_op(s, OP_scope_put_var_init);
+        emit_atom(s, class_name);
+        emit_u16(s, fd->scope_level);
+    }
+
     /* initialize the static fields */
     if (class_fields[1].fields_init_fd != NULL) {
         ClassFieldsDef *cf = &class_fields[1];
@@ -23297,15 +23312,6 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
         emit_op(s, OP_drop);
     }
     
-    if (class_name != JS_ATOM_NULL) {
-        /* store the class name in the scoped class name variable (it
-           is independent from the class statement variable
-           definition) */
-        emit_op(s, OP_dup);
-        emit_op(s, OP_scope_put_var_init);
-        emit_atom(s, class_name);
-        emit_u16(s, fd->scope_level);
-    }
     pop_scope(s);
     pop_scope(s);
 
@@ -24640,6 +24646,25 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                     fd->byte_code.buf[fd->last_opcode_pos] = OP_get_field2;
                     drop_count = 2;
                     break;
+                case OP_get_field_opt_chain:
+                    {
+                        int opt_chain_label, next_label;
+                        opt_chain_label = get_u32(fd->byte_code.buf +
+                                                  fd->last_opcode_pos + 1 + 4 + 1);
+                        /* keep the object on the stack */
+                        fd->byte_code.buf[fd->last_opcode_pos] = OP_get_field2;
+                        fd->byte_code.size = fd->last_opcode_pos + 1 + 4;
+                        next_label = emit_goto(s, OP_goto, -1);
+                        emit_label(s, opt_chain_label);
+                        /* need an additional undefined value for the
+                           case where the optional field does not
+                           exists */
+                        emit_op(s, OP_undefined);
+                        emit_label(s, next_label);
+                        drop_count = 2;
+                        opcode = OP_get_field;
+                    }
+                    break;
                 case OP_scope_get_private_field:
                     /* keep the object on the stack */
                     fd->byte_code.buf[fd->last_opcode_pos] = OP_scope_get_private_field2;
@@ -24649,6 +24674,25 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                     /* keep the object on the stack */
                     fd->byte_code.buf[fd->last_opcode_pos] = OP_get_array_el2;
                     drop_count = 2;
+                    break;
+                case OP_get_array_el_opt_chain:
+                    {
+                        int opt_chain_label, next_label;
+                        opt_chain_label = get_u32(fd->byte_code.buf +
+                                                  fd->last_opcode_pos + 1 + 1);
+                        /* keep the object on the stack */
+                        fd->byte_code.buf[fd->last_opcode_pos] = OP_get_array_el2;
+                        fd->byte_code.size = fd->last_opcode_pos + 1;
+                        next_label = emit_goto(s, OP_goto, -1);
+                        emit_label(s, opt_chain_label);
+                        /* need an additional undefined value for the
+                           case where the optional field does not
+                           exists */
+                        emit_op(s, OP_undefined);
+                        emit_label(s, next_label);
+                        drop_count = 2;
+                        opcode = OP_get_array_el;
+                    }
                     break;
                 case OP_scope_get_var:
                     {
@@ -24932,8 +24976,23 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
             break;
         }
     }
-    if (optional_chaining_label >= 0)
-        emit_label(s, optional_chaining_label);
+    if (optional_chaining_label >= 0) {
+        JSFunctionDef *fd = s->cur_func;
+        int opcode;
+        emit_label_raw(s, optional_chaining_label);
+        /* modify the last opcode so that it is an indicator of an
+           optional chain */
+        opcode = get_prev_opcode(fd);
+        if (opcode == OP_get_field || opcode == OP_get_array_el) {
+            if (opcode == OP_get_field)
+                opcode = OP_get_field_opt_chain;
+            else
+                opcode = OP_get_array_el_opt_chain;
+            fd->byte_code.buf[fd->last_opcode_pos] = opcode;
+        } else {
+            fd->last_opcode_pos = -1;
+        }
+    }
     return 0;
 }
 
@@ -24949,26 +25008,56 @@ static __exception int js_parse_delete(JSParseState *s)
         return -1;
     switch(opcode = get_prev_opcode(fd)) {
     case OP_get_field:
+    case OP_get_field_opt_chain:
         {
             JSValue val;
-            int ret;
-
+            int ret, opt_chain_label, next_label;
+            if (opcode == OP_get_field_opt_chain) {
+                opt_chain_label = get_u32(fd->byte_code.buf +
+                                          fd->last_opcode_pos + 1 + 4 + 1);
+            } else {
+                opt_chain_label = -1;
+            }
             name = get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1);
             fd->byte_code.size = fd->last_opcode_pos;
-            fd->last_opcode_pos = -1;
             val = JS_AtomToValue(s->ctx, name);
             ret = emit_push_const(s, val, 1);
             JS_FreeValue(s->ctx, val);
             JS_FreeAtom(s->ctx, name);
             if (ret)
                 return ret;
+            emit_op(s, OP_delete);
+            if (opt_chain_label >= 0) {
+                next_label = emit_goto(s, OP_goto, -1);
+                emit_label(s, opt_chain_label);
+                /* if the optional chain is not taken, return 'true' */
+                emit_op(s, OP_drop);
+                emit_op(s, OP_push_true);
+                emit_label(s, next_label);
+            }
+            fd->last_opcode_pos = -1;
         }
-        goto do_delete;
+        break;
     case OP_get_array_el:
         fd->byte_code.size = fd->last_opcode_pos;
         fd->last_opcode_pos = -1;
-    do_delete:
         emit_op(s, OP_delete);
+        break;
+    case OP_get_array_el_opt_chain:
+        {
+            int opt_chain_label, next_label;
+            opt_chain_label = get_u32(fd->byte_code.buf +
+                                      fd->last_opcode_pos + 1 + 1);
+            fd->byte_code.size = fd->last_opcode_pos;
+            emit_op(s, OP_delete);
+            next_label = emit_goto(s, OP_goto, -1);
+            emit_label(s, opt_chain_label);
+            /* if the optional chain is not taken, return 'true' */
+            emit_op(s, OP_drop);
+            emit_op(s, OP_push_true);
+            emit_label(s, next_label);
+            fd->last_opcode_pos = -1;
+        }
         break;
     case OP_scope_get_var:
         /* 'delete this': this is not a reference */
@@ -31603,6 +31692,17 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
         case OP_set_class_name:
             /* only used during parsing */
             break;
+
+        case OP_get_field_opt_chain: /* equivalent to OP_get_field */
+            {
+                JSAtom name = get_u32(bc_buf + pos + 1);
+                dbuf_putc(&bc_out, OP_get_field);
+                dbuf_put_u32(&bc_out, name);
+            }
+            break;
+        case OP_get_array_el_opt_chain: /* equivalent to OP_get_array_el */
+            dbuf_putc(&bc_out, OP_get_array_el);
+            break;
             
         default:
         no_change:
@@ -33908,9 +34008,15 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     if (js_is_live_code(s)) {
         emit_return(s, FALSE);
     }
-done:
+ done:
     s->cur_func = fd->parent;
 
+    /* Reparse identifiers after the function is terminated so that
+       the token is parsed in the englobing function. It could be done
+       by just using next_token() here for normal functions, but it is
+       necessary for arrow functions with an expression body. */
+    reparse_ident_token(s);
+    
     /* create the function object */
     {
         int idx;
@@ -43054,22 +43160,11 @@ static const JSCFunctionListEntry js_math_obj[] = {
 
 /* OS dependent. d = argv[0] is in ms from 1970. Return the difference
    between UTC time and local time 'd' in minutes */
-static int getTimezoneOffset(int64_t time) {
-#if defined(_WIN32)
-    /* iomars Fix timezone bug on win32 platform */
-    time_t now = (time_t)(time / 1000);
-  
-    struct tm *gm = gmtime(&now);
-    time_t gmt = mktime(gm);
-  
-    struct tm *loc = localtime(&now);
-    time_t local = mktime(loc);
-  
-    return -(int)difftime(local, gmt) / 60;
-#else
+static int getTimezoneOffset(int64_t time)
+{
     time_t ti;
-    struct tm tm;
-
+    int res;
+    
     time /= 1000; /* convert to seconds */
     if (sizeof(time_t) == 4) {
         /* on 32-bit systems, we need to clamp the time value to the
@@ -43092,9 +43187,27 @@ static int getTimezoneOffset(int64_t time) {
         }
     }
     ti = time;
-    localtime_r(&ti, &tm);
-    return -tm.tm_gmtoff / 60;
+#if defined(_WIN32)
+    {
+        struct tm *tm;
+        time_t gm_ti, loc_ti;
+        
+        tm = gmtime(&ti);
+        gm_ti = mktime(tm);
+        
+        tm = localtime(&ti);
+        loc_ti = mktime(tm);
+
+        res = (gm_ti - loc_ti) / 60;
+    }
+#else
+    {
+        struct tm tm;
+        localtime_r(&ti, &tm);
+        res = -tm.tm_gmtoff / 60;
+    }
 #endif
+    return res;
 }
 
 #if 0
@@ -49471,7 +49584,7 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
             break;
         case 3:
             pos += snprintf(buf + pos, sizeof(buf) - pos,
-                            "%02d:%02d:%02d %cM", (h + 1) % 12 - 1, m, s,
+                            "%02d:%02d:%02d %cM", (h + 11) % 12 + 1, m, s,
                             (h < 12) ? 'A' : 'P');
             break;
         }
