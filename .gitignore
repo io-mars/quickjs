@@ -6,6 +6,8 @@
 *.dll
 *.s
 *.o
+out*.c
+build.log
 include/**
 quickjs-*.zip
 qjscalc.c
