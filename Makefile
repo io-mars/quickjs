@@ -1,6 +1,6 @@
 #
 # QuickJS Javascript Engine
-# 
+#
 # Copyright (c) 2017-2021 Fabrice Bellard
 # Copyright (c) 2017-2021 Charlie Gordon
 #
@@ -30,6 +30,9 @@ CONFIG_M32=y
 else ifeq (MINGW64,$(findstring MINGW64,$(shell uname -s)))
 CONFIG_WIN32=y
 endif
+ifeq ($(shell uname -s),FreeBSD)
+CONFIG_FREEBSD=y
+endif
 # Windows cross compilation from Linux
 #CONFIG_WIN32=y
 # use link time optimization (smaller and faster executables but slower build)
@@ -48,7 +51,12 @@ PREFIX?=/usr/local
 #CONFIG_PROFILE=y
 # use address sanitizer
 #CONFIG_ASAN=y
-# include the code for BigFloat/BigDecimal, math mode and faster large integers
+# use memory sanitizer
+#CONFIG_MSAN=y
+# use UB sanitizer
+#CONFIG_UBSAN=y
+
+# include the code for BigFloat/BigDecimal and math mode
 CONFIG_BIGNUM=y
 
 OBJDIR=.obj
@@ -57,6 +65,12 @@ ifdef CONFIG_DARWIN
 # use clang instead of gcc
 CONFIG_CLANG=y
 CONFIG_DEFAULT_AR=y
+endif
+ifdef CONFIG_FREEBSD
+# use clang instead of gcc
+CONFIG_CLANG=y
+CONFIG_DEFAULT_AR=y
+CONFIG_LTO=
 endif
 
 ifdef CONFIG_WIN32
@@ -147,6 +161,14 @@ ifdef CONFIG_ASAN
 CFLAGS+=-fsanitize=address -fno-omit-frame-pointer
 LDFLAGS+=-fsanitize=address -fno-omit-frame-pointer
 endif
+ifdef CONFIG_MSAN
+CFLAGS+=-fsanitize=memory -fno-omit-frame-pointer
+LDFLAGS+=-fsanitize=memory -fno-omit-frame-pointer
+endif
+ifdef CONFIG_UBSAN
+CFLAGS+=-fsanitize=undefined -fno-omit-frame-pointer
+LDFLAGS+=-fsanitize=undefined -fno-omit-frame-pointer
+endif
 ifdef CONFIG_WIN32
 LDEXPORT=
 LDEXTRAS=$(LDEXPORT)
@@ -184,18 +206,21 @@ endif
 
 # examples
 ifeq ($(CROSS_PREFIX),)
-PROGS+=examples/hello
 ifndef CONFIG_ASAN
-PROGS+=examples/hello_module
-endif
+ifndef CONFIG_MSAN
+ifndef CONFIG_UBSAN
+PROGS+=examples/hello examples/hello_module examples/test_fib
 ifdef CONFIG_SHARED_LIBS
-PROGS+=examples/test_fib examples/fib.so examples/point.so
+PROGS+=examples/fib.so examples/point.so
+endif
+endif
+endif
 endif
 endif
 
 all: $(OBJDIR) $(OBJDIR)/quickjs.check.o $(OBJDIR)/qjs.check.o $(PROGS)
 
-QJS_LIB_OBJS=$(OBJDIR)/quickjs.o $(OBJDIR)/libregexp.o $(OBJDIR)/libunicode.o $(OBJDIR)/cutils.o $(OBJDIR)/quickjs-libc.o $(OBJDIR)/libbf.o 
+QJS_LIB_OBJS=$(OBJDIR)/quickjs.o $(OBJDIR)/libregexp.o $(OBJDIR)/libunicode.o $(OBJDIR)/cutils.o $(OBJDIR)/quickjs-libc.o $(OBJDIR)/libbf.o
 
 QJS_OBJS=$(OBJDIR)/qjs.o $(OBJDIR)/repl.o $(QJS_LIB_OBJS)
 ifdef CONFIG_BIGNUM
@@ -385,11 +410,11 @@ examples/point.so: $(OBJDIR)/examples/point.pic.o
 ###############################################################################
 # documentation
 
-DOCS=doc/quickjs.pdf doc/quickjs.html doc/jsbignum.pdf doc/jsbignum.html 
+DOCS=doc/quickjs.pdf doc/quickjs.html doc/jsbignum.pdf doc/jsbignum.html
 
 build_doc: $(DOCS)
 
-clean_doc: 
+clean_doc:
 	rm -f $(DOCS)
 
 doc/%.pdf: doc/%.texi
@@ -454,10 +479,10 @@ stats: qjs qjs32
 	./qjs32 -qd
 
 microbench: qjs
-	./qjs tests/microbench.js
+	./qjs --std tests/microbench.js
 
 microbench-32: qjs32
-	./qjs32 tests/microbench.js
+	./qjs32 --std tests/microbench.js
 
 # ES5 tests (obsolete)
 test2o: run-test262
