@@ -61,6 +61,16 @@ CONFIG_BIGNUM=y
 
 OBJDIR=.obj
 
+ifdef CONFIG_ASAN
+OBJDIR:=$(OBJDIR)/asan
+endif
+ifdef CONFIG_MSAN
+OBJDIR:=$(OBJDIR)/msan
+endif
+ifdef CONFIG_UBSAN
+OBJDIR:=$(OBJDIR)/ubsan
+endif
+
 ifdef CONFIG_DARWIN
 # use clang instead of gcc
 CONFIG_CLANG=y
@@ -443,6 +453,7 @@ test: qjs
 	./qjs tests/test_language.js
 	./qjs tests/test_builtin.js
 	./qjs tests/test_loop.js
+	./qjs tests/test_bignum.js
 	./qjs tests/test_std.js
 	./qjs tests/test_worker.js
 ifdef CONFIG_SHARED_LIBS
@@ -455,7 +466,7 @@ endif
 endif
 ifdef CONFIG_BIGNUM
 	./qjs --bignum tests/test_op_overloading.js
-	./qjs --bignum tests/test_bignum.js
+	./qjs --bignum tests/test_bigfloat.js
 	./qjs --qjscalc tests/test_qjscalc.js
 endif
 ifdef CONFIG_M32
@@ -464,11 +475,12 @@ ifndef CONFIG_WIN32
 	./qjs32 tests/test_language.js
 	./qjs32 tests/test_builtin.js
 	./qjs32 tests/test_loop.js
+	./qjs32 tests/test_bignum.js
 	./qjs32 tests/test_std.js
 	./qjs32 tests/test_worker.js
 ifdef CONFIG_BIGNUM
 	./qjs32 --bignum tests/test_op_overloading.js
-	./qjs32 --bignum tests/test_bignum.js
+	./qjs32 --bignum tests/test_bigfloat.js
 	./qjs32 --qjscalc tests/test_qjscalc.js
 endif
 endif
@@ -484,6 +496,10 @@ microbench: qjs
 microbench-32: qjs32
 	./qjs32 --std tests/microbench.js
 
+ifeq ($(wildcard test262o/tests.txt),)
+test2o test2o-32 test2o-update:
+	@echo test262o tests not installed
+else
 # ES5 tests (obsolete)
 test2o: run-test262
 	time ./run-test262 -m -c test262o.conf
@@ -493,7 +509,12 @@ test2o-32: run-test262-32
 
 test2o-update: run-test262
 	./run-test262 -u -c test262o.conf
+endif
 
+ifeq ($(wildcard test262o/tests.txt),)
+test2 test2-32 test2-update test2-default test2-check:
+	@echo test262 tests not installed
+else
 # Test262 tests
 test2-default: run-test262
 	time ./run-test262 -m -c test262.conf
@@ -509,6 +530,7 @@ test2-update: run-test262
 
 test2-check: run-test262
 	time ./run-test262 -m -c test262.conf -E -a
+endif
 
 testall: all test microbench test2o test2
 

@@ -34913,7 +34913,7 @@ static int JS_WriteBigNum(BCWriterState *s, JSValueConst obj)
         e = a->expn + 3;
     else
         e = a->expn;
-    e = (e << 1) | a->sign;
+    e = (e * 2) | a->sign;
     if (e < INT32_MIN || e > INT32_MAX) {
         JS_ThrowInternalError(s->ctx, "bignum exponent is too large");
         return -1;
@@ -43098,14 +43098,16 @@ static double js_math_fround(double a)
 static JSValue js_math_imul(JSContext *ctx, JSValueConst this_val,
                             int argc, JSValueConst *argv)
 {
-    int a, b;
+    uint32_t a, b, c;
+    int32_t d;
 
-    if (JS_ToInt32(ctx, &a, argv[0]))
+    if (JS_ToUint32(ctx, &a, argv[0]))
         return JS_EXCEPTION;
-    if (JS_ToInt32(ctx, &b, argv[1]))
+    if (JS_ToUint32(ctx, &b, argv[1]))
         return JS_EXCEPTION;
-    /* purposely ignoring overflow */
-    return JS_NewInt32(ctx, a * b);
+    c = a * b;
+    memcpy(&d, &c, sizeof(d));
+    return JS_NewInt32(ctx, d);
 }
 
 static JSValue js_math_clz32(JSContext *ctx, JSValueConst this_val,
