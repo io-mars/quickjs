@@ -3691,10 +3691,9 @@ static int string_buffer_putc(StringBuffer *s, uint32_t c)
 {
     if (unlikely(c >= 0x10000)) {
         /* surrogate pair */
-        c -= 0x10000;
-        if (string_buffer_putc16(s, (c >> 10) + 0xd800))
+        if (string_buffer_putc16(s, get_hi_surrogate(c)))
             return -1;
-        c = (c & 0x3ff) + 0xdc00;
+        c = get_lo_surrogate(c);
     }
     return string_buffer_putc16(s, c);
 }
@@ -3705,10 +3704,10 @@ static int string_getc(const JSString *p, int *pidx)
     idx = *pidx;
     if (p->is_wide_char) {
         c = p->u.str16[idx++];
-        if (c >= 0xd800 && c < 0xdc00 && idx < p->len) {
+        if (is_hi_surrogate(c) && idx < p->len) {
             c1 = p->u.str16[idx];
-            if (c1 >= 0xdc00 && c1 < 0xe000) {
-                c = (((c & 0x3ff) << 10) | (c1 & 0x3ff)) + 0x10000;
+            if (is_lo_surrogate(c1)) {
+                c = from_surrogate(c, c1);
                 idx++;
             }
         }
@@ -3906,9 +3905,8 @@ JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
                 } else if (c <= 0x10FFFF) {
                     p = p_next;
                     /* surrogate pair */
-                    c -= 0x10000;
-                    string_buffer_putc16(b, (c >> 10) + 0xd800);
-                    c = (c & 0x3ff) + 0xdc00;
+                    string_buffer_putc16(b, get_hi_surrogate(c));
+                    c = get_lo_surrogate(c);
                 } else {
                     /* invalid char */
                     c = 0xfffd;
@@ -4046,13 +4044,12 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1, BO
             if (c < 0x80) {
                 *q++ = c;
             } else {
-                if (c >= 0xd800 && c < 0xdc00) {
+                if (is_hi_surrogate(c)) {
                     if (pos < len && !cesu8) {
                         c1 = src[pos];
-                        if (c1 >= 0xdc00 && c1 < 0xe000) {
+                        if (is_lo_surrogate(c1)) {
                             pos++;
-                            /* surrogate pair */
-                            c = (((c & 0x3ff) << 10) | (c1 & 0x3ff)) + 0x10000;
+                            c = from_surrogate(c, c1);
                         } else {
                             /* Keep unmatched surrogate code points */
                             /* c = 0xfffd; */ /* error */
@@ -11735,7 +11732,7 @@ static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
                 goto fail;
             break;
         default:
-            if (c < 32 || (c >= 0xd800 && c < 0xe000)) {
+            if (c < 32 || is_surrogate(c)) {
                 snprintf(buf, sizeof(buf), "\\u%04x", c);
                 if (string_buffer_puts8(b, buf))
                     goto fail;
@@ -34588,8 +34585,6 @@ typedef enum BCTagEnum {
     BC_TAG_OBJECT,
     BC_TAG_ARRAY,
     BC_TAG_BIG_INT,
-    BC_TAG_BIG_FLOAT,
-    BC_TAG_BIG_DECIMAL,
     BC_TAG_TEMPLATE_OBJECT,
     BC_TAG_FUNCTION_BYTECODE,
     BC_TAG_MODULE,
@@ -34599,24 +34594,21 @@ typedef enum BCTagEnum {
     BC_TAG_DATE,
     BC_TAG_OBJECT_VALUE,
     BC_TAG_OBJECT_REFERENCE,
+#ifdef CONFIG_BIGNUM
+    BC_TAG_BIG_FLOAT,
+    BC_TAG_BIG_DECIMAL,
+#endif
 } BCTagEnum;
 
 #ifdef CONFIG_BIGNUM
-#define BC_BASE_VERSION 2
+#define BC_VERSION 0x43
 #else
-#define BC_BASE_VERSION 1
-#endif
-#define BC_BE_VERSION 0x40
-#ifdef WORDS_BIGENDIAN
-#define BC_VERSION (BC_BASE_VERSION | BC_BE_VERSION)
-#else
-#define BC_VERSION BC_BASE_VERSION
+#define BC_VERSION 3
 #endif
 
 typedef struct BCWriterState {
     JSContext *ctx;
     DynBuf dbuf;
-    BOOL byte_swap : 8;
     BOOL allow_bytecode : 8;
     BOOL allow_sab : 8;
     BOOL allow_reference : 8;
@@ -34646,8 +34638,6 @@ static const char * const bc_tag_str[] = {
     "object",
     "array",
     "bigint",
-    "bigfloat",
-    "bigdecimal",
     "template",
     "function",
     "module",
@@ -34657,8 +34647,21 @@ static const char * const bc_tag_str[] = {
     "Date",
     "ObjectValue",
     "ObjectReference",
+#ifdef CONFIG_BIGNUM
+    "bigfloat",
+    "bigdecimal",
+#endif
 };
 #endif
+
+static inline BOOL is_be(void)
+{
+    union {
+        uint16_t a;
+        uint8_t  b;
+    } u = {0x100};
+    return u.b;
+}
 
 static void bc_put_u8(BCWriterState *s, uint8_t v)
 {
@@ -34667,21 +34670,21 @@ static void bc_put_u8(BCWriterState *s, uint8_t v)
 
 static void bc_put_u16(BCWriterState *s, uint16_t v)
 {
-    if (s->byte_swap)
+    if (is_be())
         v = bswap16(v);
     dbuf_put_u16(&s->dbuf, v);
 }
 
 static __maybe_unused void bc_put_u32(BCWriterState *s, uint32_t v)
 {
-    if (s->byte_swap)
+    if (is_be())
         v = bswap32(v);
     dbuf_put_u32(&s->dbuf, v);
 }
 
 static void bc_put_u64(BCWriterState *s, uint64_t v)
 {
-    if (s->byte_swap)
+    if (is_be())
         v = bswap64(v);
     dbuf_put(&s->dbuf, (uint8_t *)&v, sizeof(v));
 }
@@ -34851,7 +34854,7 @@ static int JS_WriteFunctionBytecode(BCWriterState *s,
         pos += len;
     }
 
-    if (s->byte_swap)
+    if (is_be())
         bc_byte_swap(bc_buf, bc_len);
 
     dbuf_put(&s->dbuf, bc_buf, bc_len);
@@ -34942,20 +34945,14 @@ static int JS_WriteBigNum(BCWriterState *s, JSValueConst obj)
             bc_put_leb128(s, len);
             /* always saved in byte based little endian representation */
             for(j = 0; j < n1; j++) {
-                dbuf_putc(&s->dbuf, v >> (j * 8));
+                bc_put_u8(s, v >> (j * 8));
             }
             for(; i < a->len; i++) {
                 limb_t v = a->tab[i];
 #if LIMB_BITS == 32
-#ifdef WORDS_BIGENDIAN
-                v = bswap32(v);
-#endif
-                dbuf_put_u32(&s->dbuf, v);
+                bc_put_u32(s, v);
 #else
-#ifdef WORDS_BIGENDIAN
-                v = bswap64(v);
-#endif
-                dbuf_put_u64(&s->dbuf, v);
+                bc_put_u64(s, v);
 #endif
             }
         } else {
@@ -34998,14 +34995,14 @@ static int JS_WriteBigNum(BCWriterState *s, JSValueConst obj)
                         v8 = d;
                         bpos = 1;
                     } else {
-                        dbuf_putc(&s->dbuf, v8 | (d << 4));
+                        bc_put_u8(s, v8 | (d << 4));
                         bpos = 0;
                     }
                 }
             }
             /* flush the last digit */
             if (bpos) {
-                dbuf_putc(&s->dbuf, v8);
+                bc_put_u8(s, v8);
             }
         }
     }
@@ -35418,15 +35415,10 @@ static int JS_WriteObjectAtoms(BCWriterState *s)
     JSRuntime *rt = s->ctx->rt;
     DynBuf dbuf1;
     int i, atoms_size;
-    uint8_t version;
 
     dbuf1 = s->dbuf;
     js_dbuf_init(s->ctx, &s->dbuf);
-
-    version = BC_VERSION;
-    if (s->byte_swap)
-        version ^= BC_BE_VERSION;
-    bc_put_u8(s, version);
+    bc_put_u8(s, BC_VERSION);
 
     bc_put_leb128(s, s->idx_to_atom_count);
     for(i = 0; i < s->idx_to_atom_count; i++) {
@@ -35459,8 +35451,6 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
 
     memset(s, 0, sizeof(*s));
     s->ctx = ctx;
-    /* XXX: byte swapped output is untested */
-    s->byte_swap = ((flags & JS_WRITE_OBJ_BSWAP) != 0);
     s->allow_bytecode = ((flags & JS_WRITE_OBJ_BYTECODE) != 0);
     s->allow_sab = ((flags & JS_WRITE_OBJ_SAB) != 0);
     s->allow_reference = ((flags & JS_WRITE_OBJ_REFERENCE) != 0);
@@ -35581,33 +35571,45 @@ static int bc_get_u8(BCReaderState *s, uint8_t *pval)
 
 static int bc_get_u16(BCReaderState *s, uint16_t *pval)
 {
+    uint16_t v;
     if (unlikely(s->buf_end - s->ptr < 2)) {
         *pval = 0; /* avoid warning */
         return bc_read_error_end(s);
     }
-    *pval = get_u16(s->ptr);
+    v = get_u16(s->ptr);
+    if (is_be())
+        v = bswap16(v);
+    *pval = v;
     s->ptr += 2;
     return 0;
 }
 
 static __maybe_unused int bc_get_u32(BCReaderState *s, uint32_t *pval)
 {
+    uint32_t v;
     if (unlikely(s->buf_end - s->ptr < 4)) {
         *pval = 0; /* avoid warning */
         return bc_read_error_end(s);
     }
-    *pval = get_u32(s->ptr);
+    v = get_u32(s->ptr);
+    if (is_be())
+        v = bswap32(v);
+    *pval = v;
     s->ptr += 4;
     return 0;
 }
 
 static int bc_get_u64(BCReaderState *s, uint64_t *pval)
 {
+    uint64_t v;
     if (unlikely(s->buf_end - s->ptr < 8)) {
         *pval = 0; /* avoid warning */
         return bc_read_error_end(s);
     }
-    *pval = get_u64(s->ptr);
+    v = get_u64(s->ptr);
+    if (is_be())
+        v = bswap64(v);
+    *pval = v;
     s->ptr += 8;
     return 0;
 }
@@ -35717,10 +35719,15 @@ static JSString *JS_ReadString(BCReaderState *s)
         js_free_string(s->ctx->rt, p);
         return NULL;
     }
-    // XXX: potential endianness issue
     memcpy(p->u.str8, s->ptr, size);
     s->ptr += size;
-    if (!is_wide_char) {
+    if (is_wide_char) {
+        if (is_be()) {
+            uint32_t i;
+            for (i = 0; i < len; i++)
+                p->u.str16[i] = bswap16(p->u.str16[i]);
+        }
+    } else {
         p->u.str8[size] = '\0'; /* add the trailing zero for 8 bit strings */
     }
 #ifdef DUMP_READ_OBJECT
@@ -35758,6 +35765,9 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
             return -1;
     }
     b->byte_code_buf = bc_buf;
+
+    if (is_be())
+        bc_byte_swap(bc_buf, bc_len);
 
     pos = 0;
     while (pos < bc_len) {
@@ -35879,15 +35889,9 @@ static JSValue JS_ReadBigNum(BCReaderState *s, int tag)
 #if LIMB_BITS == 32
                 if (bc_get_u32(s, &v))
                     goto fail;
-#ifdef WORDS_BIGENDIAN
-                v = bswap32(v);
-#endif
 #else
                 if (bc_get_u64(s, &v))
                     goto fail;
-#ifdef WORDS_BIGENDIAN
-                v = bswap64(v);
-#endif
 #endif
                 a->tab[i] = v;
             }
@@ -36595,7 +36599,6 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
 
     if (bc_get_u8(s, &v8))
         return -1;
-    /* XXX: could support byte swapped input */
     if (v8 != BC_VERSION) {
         JS_ThrowSyntaxError(s->ctx, "invalid version (%d expected=%d)",
                             v8, BC_VERSION);
@@ -41583,18 +41586,18 @@ static int64_t string_advance_index(JSString *p, int64_t index, BOOL unicode)
    -1 if none */
 static int js_string_find_invalid_codepoint(JSString *p)
 {
-    int i, c;
+    int i;
     if (!p->is_wide_char)
         return -1;
     for(i = 0; i < p->len; i++) {
-        c = p->u.str16[i];
-        if (c >= 0xD800 && c <= 0xDFFF) {
-            if (c >= 0xDC00 || (i + 1) >= p->len)
+        uint32_t c = p->u.str16[i];
+        if (is_surrogate(c)) {
+            if (is_hi_surrogate(c) && (i + 1) < p->len
+            &&  is_lo_surrogate(p->u.str16[i + 1])) {
+                i++;
+            } else {
                 return i;
-            c = p->u.str16[i + 1];
-            if (c < 0xDC00 || c > 0xDFFF)
-                return i;
-            i++;
+            }
         }
     }
     return -1;
@@ -41621,7 +41624,7 @@ static JSValue js_string_toWellFormed(JSContext *ctx, JSValueConst this_val,
 {
     JSValue str, ret;
     JSString *p;
-    int c, i;
+    int i;
 
     str = JS_ToStringCheckObject(ctx, this_val);
     if (JS_IsException(str))
@@ -41640,17 +41643,13 @@ static JSValue js_string_toWellFormed(JSContext *ctx, JSValueConst this_val,
 
     p = JS_VALUE_GET_STRING(ret);
     for (; i < p->len; i++) {
-        c = p->u.str16[i];
-        if (c >= 0xD800 && c <= 0xDFFF) {
-            if (c >= 0xDC00 || (i + 1) >= p->len) {
-                p->u.str16[i] = 0xFFFD;
+        uint32_t c = p->u.str16[i];
+        if (is_surrogate(c)) {
+            if (is_hi_surrogate(c) && (i + 1) < p->len
+            &&  is_lo_surrogate(p->u.str16[i + 1])) {
+                i++;
             } else {
-                c = p->u.str16[i + 1];
-                if (c < 0xDC00 || c > 0xDFFF) {
-                    p->u.str16[i] = 0xFFFD;
-                } else {
-                    i++;
-                }
+                p->u.str16[i] = 0xFFFD;
             }
         }
     }
@@ -42427,10 +42426,10 @@ static int string_prevc(JSString *p, int *pidx)
     idx--;
     if (p->is_wide_char) {
         c = p->u.str16[idx];
-        if (c >= 0xdc00 && c < 0xe000 && idx > 0) {
+        if (is_lo_surrogate(c) && idx > 0) {
             c1 = p->u.str16[idx - 1];
-            if (c1 >= 0xd800 && c1 <= 0xdc00) {
-                c = (((c1 & 0x3ff) << 10) | (c & 0x3ff)) + 0x10000;
+            if (is_hi_surrogate(c1)) {
+                c = from_surrogate(c1, c);
                 idx--;
             }
         }
@@ -43355,7 +43354,7 @@ static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
                 mask = LRE_FLAG_DOTALL;
                 break;
             case 'u':
-                mask = LRE_FLAG_UTF16;
+                mask = LRE_FLAG_UNICODE;
                 break;
             case 'y':
                 mask = LRE_FLAG_STICKY;
@@ -43373,7 +43372,7 @@ static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
         JS_FreeCString(ctx, str);
     }
 
-    str = JS_ToCStringLen2(ctx, &len, pattern, !(re_flags & LRE_FLAG_UTF16));
+    str = JS_ToCStringLen2(ctx, &len, pattern, !(re_flags & LRE_FLAG_UNICODE));
     if (!str)
         return JS_EXCEPTION;
     re_bytecode_buf = lre_compile(&re_bytecode_len, error_msg,
@@ -44040,7 +44039,7 @@ static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValueCon
             break;
         }
         if (end == start) {
-            if (!(re_flags & LRE_FLAG_UTF16) || (unsigned)end >= str->len || !str->is_wide_char) {
+            if (!(re_flags & LRE_FLAG_UNICODE) || (unsigned)end >= str->len || !str->is_wide_char) {
                 end++;
             } else {
                 string_getc(str, &end);
@@ -44815,7 +44814,7 @@ static const JSCFunctionListEntry js_regexp_proto_funcs[] = {
     JS_CGETSET_MAGIC_DEF("ignoreCase", js_regexp_get_flag, NULL, LRE_FLAG_IGNORECASE ),
     JS_CGETSET_MAGIC_DEF("multiline", js_regexp_get_flag, NULL, LRE_FLAG_MULTILINE ),
     JS_CGETSET_MAGIC_DEF("dotAll", js_regexp_get_flag, NULL, LRE_FLAG_DOTALL ),
-    JS_CGETSET_MAGIC_DEF("unicode", js_regexp_get_flag, NULL, LRE_FLAG_UTF16 ),
+    JS_CGETSET_MAGIC_DEF("unicode", js_regexp_get_flag, NULL, LRE_FLAG_UNICODE ),
     JS_CGETSET_MAGIC_DEF("sticky", js_regexp_get_flag, NULL, LRE_FLAG_STICKY ),
     JS_CGETSET_MAGIC_DEF("hasIndices", js_regexp_get_flag, NULL, LRE_FLAG_INDICES ),
     JS_CFUNC_DEF("exec", 1, js_regexp_exec ),
@@ -49114,8 +49113,7 @@ static JSValue js_global_decodeURI(JSContext *ctx, JSValueConst this_val,
                     }
                     c = (c << 6) | (c1 & 0x3f);
                 }
-                if (c < c_min || c > 0x10FFFF ||
-                    (c >= 0xd800 && c < 0xe000)) {
+                if (c < c_min || c > 0x10FFFF || is_surrogate(c)) {
                     js_throw_URIError(ctx, "malformed UTF-8");
                     goto fail;
                 }
@@ -49190,21 +49188,21 @@ static JSValue js_global_encodeURI(JSContext *ctx, JSValueConst this_val,
         if (isURIUnescaped(c, isComponent)) {
             string_buffer_putc16(b, c);
         } else {
-            if (c >= 0xdc00 && c <= 0xdfff) {
+            if (is_lo_surrogate(c)) {
                 js_throw_URIError(ctx, "invalid character");
                 goto fail;
-            } else if (c >= 0xd800 && c <= 0xdbff) {
+            } else if (is_hi_surrogate(c)) {
                 if (k >= p->len) {
                     js_throw_URIError(ctx, "expecting surrogate pair");
                     goto fail;
                 }
                 c1 = string_get(p, k);
                 k++;
-                if (c1 < 0xdc00 || c1 > 0xdfff) {
+                if (!is_lo_surrogate(c1)) {
                     js_throw_URIError(ctx, "expecting surrogate pair");
                     goto fail;
                 }
-                c = (((c & 0x3ff) << 10) | (c1 & 0x3ff)) + 0x10000;
+                c = from_surrogate(c, c1);
             }
             if (c < 0x80) {
                 encodeURI_hex(b, c);
@@ -54863,12 +54861,9 @@ static JSValue js_dataview_getValue(JSContext *ctx,
     size = 1 << typed_array_size_log2(class_id);
     if (JS_ToIndex(ctx, &pos, argv[0]))
         return JS_EXCEPTION;
-    is_swap = FALSE;
+    is_swap = TRUE;
     if (argc > 1)
-        is_swap = JS_ToBool(ctx, argv[1]);
-#ifndef WORDS_BIGENDIAN
-    is_swap ^= 1;
-#endif
+        is_swap = !JS_ToBool(ctx, argv[1]);
     abuf = ta->buffer->u.array_buffer;
     if (abuf->detached)
         return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
@@ -54992,12 +54987,9 @@ static JSValue js_dataview_setValue(JSContext *ctx,
             v64 = u.u64;
         }
     }
-    is_swap = FALSE;
+    is_swap = TRUE;
     if (argc > 2)
-        is_swap = JS_ToBool(ctx, argv[2]);
-#ifndef WORDS_BIGENDIAN
-    is_swap ^= 1;
-#endif
+        is_swap = !JS_ToBool(ctx, argv[2]);
     abuf = ta->buffer->u.array_buffer;
     if (abuf->detached)
         return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);

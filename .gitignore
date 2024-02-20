@@ -1,3 +1,13 @@
+*.exe*
+*.lib
+*.dll
+*.s
+*.o
+out*.c
+build.log
+include/**
+quickjs-*.zip
+
 *.a
 .obj/
 tests/bjson.so
@@ -20,13 +30,6 @@ test262o
 test262o_*.txt
 unicode
 unicode_gen
+run_octane
+run_sunspider_like
 
-*.exe*
-*.lib
-*.dll
-*.s
-*.o
-out*.c
-build.log
-include/**
-quickjs-*.zip

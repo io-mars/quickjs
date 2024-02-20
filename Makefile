@@ -359,6 +359,7 @@ clean:
 	rm -f examples/*.so tests/*.so
 	rm -rf $(OBJDIR)/ *.dSYM/ qjs-debug
 	rm -rf run-test262-debug run-test262-32
+	rm -f run_octane run_sunspider_like
 
 install: all
 	mkdir -p "$(DESTDIR)$(PREFIX)/bin"
@@ -502,13 +503,13 @@ test2o test2o-32 test2o-update:
 else
 # ES5 tests (obsolete)
 test2o: run-test262
-	time ./run-test262 -m -c test262o.conf
+	time ./run-test262 -t -m -c test262o.conf
 
 test2o-32: run-test262-32
-	time ./run-test262-32 -m -c test262o.conf
+	time ./run-test262-32 -t -m -c test262o.conf
 
 test2o-update: run-test262
-	./run-test262 -u -c test262o.conf
+	./run-test262 -t -u -c test262o.conf
 endif
 
 ifeq ($(wildcard test262o/tests.txt),)
@@ -517,19 +518,19 @@ test2 test2-32 test2-update test2-default test2-check:
 else
 # Test262 tests
 test2-default: run-test262
-	time ./run-test262 -m -c test262.conf
+	time ./run-test262 -t -m -c test262.conf
 
 test2: run-test262
-	time ./run-test262 -m -c test262.conf -a
+	time ./run-test262 -t -m -c test262.conf -a
 
 test2-32: run-test262-32
-	time ./run-test262-32 -m -c test262.conf -a
+	time ./run-test262-32 -t -m -c test262.conf -a
 
 test2-update: run-test262
-	./run-test262 -u -c test262.conf -a
+	./run-test262 -t -u -c test262.conf -a
 
 test2-check: run-test262
-	time ./run-test262 -m -c test262.conf -E -a
+	time ./run-test262 -t -m -c test262.conf -E -a
 endif
 
 testall: all test microbench test2o test2
@@ -544,5 +545,19 @@ bench-v8: qjs
 
 tests/bjson.so: $(OBJDIR)/tests/bjson.pic.o
 	$(CC) $(LDFLAGS) -shared -o $@ $^ $(LIBS)
+
+BENCHMARKDIR=../quickjs-benchmarks
+
+run_sunspider_like: $(BENCHMARKDIR)/run_sunspider_like.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -DNO_INCLUDE_DIR -I. -o $@ $< libquickjs$(LTOEXT).a $(LIBS)
+
+run_octane: $(BENCHMARKDIR)/run_octane.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -DNO_INCLUDE_DIR -I. -o $@ $< libquickjs$(LTOEXT).a $(LIBS)
+
+benchmarks: run_sunspider_like run_octane
+	./run_sunspider_like $(BENCHMARKDIR)/kraken-1.0/
+	./run_sunspider_like $(BENCHMARKDIR)/kraken-1.1/
+	./run_sunspider_like $(BENCHMARKDIR)/sunspider-1.0/
+	./run_octane $(BENCHMARKDIR)/
 
 -include $(wildcard $(OBJDIR)/*.d)
