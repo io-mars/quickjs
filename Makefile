@@ -24,11 +24,6 @@
 
 ifeq ($(shell uname -s),Darwin)
 CONFIG_DARWIN=y
-else ifeq (MINGW32,$(findstring MINGW32,$(shell uname -s)))
-CONFIG_WIN32=y
-CONFIG_M32=y
-else ifeq (MINGW64,$(findstring MINGW64,$(shell uname -s)))
-CONFIG_WIN32=y
 endif
 ifeq ($(shell uname -s),FreeBSD)
 CONFIG_FREEBSD=y
@@ -181,7 +176,6 @@ LDFLAGS+=-fsanitize=undefined -fno-omit-frame-pointer
 endif
 ifdef CONFIG_WIN32
 LDEXPORT=
-LDEXTRAS=$(LDEXPORT)
 else
 LDEXPORT=-rdynamic
 endif
@@ -205,9 +199,7 @@ ifndef CONFIG_WIN32
 PROGS+=qjscalc
 endif
 ifdef CONFIG_M32
-ifndef CONFIG_WIN32
 PROGS+=qjs32 qjs32_s
-endif
 endif
 PROGS+=libquickjs.a
 ifdef CONFIG_LTO
@@ -254,13 +246,13 @@ qjs-debug$(EXE): $(patsubst %.o, %.debug.o, $(QJS_OBJS))
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 qjsc$(EXE): $(OBJDIR)/qjsc.o $(QJS_LIB_OBJS)
-	$(CC) $(LDFLAGS) $(LDEXTRAS) -o $@ $^ $(LIBS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 ifneq ($(CROSS_PREFIX),)
 
 $(QJSC): $(OBJDIR)/qjsc.host.o \
     $(patsubst %.o, %.host.o, $(QJS_LIB_OBJS))
-	$(HOST_CC) $(LDFLAGS) $(LDEXTRAS) -o $@ $^ $(HOST_LIBS)
+	$(HOST_CC) $(LDFLAGS) -o $@ $^ $(HOST_LIBS)
 
 endif #CROSS_PREFIX
 
@@ -278,7 +270,7 @@ qjs32: $(patsubst %.o, %.m32.o, $(QJS_OBJS))
 
 qjs32_s: $(patsubst %.o, %.m32s.o, $(QJS_OBJS))
 	$(CC) -m32 $(LDFLAGS) -o $@ $^ $(LIBS)
-	@size $@
+# 	@size $@
 
 qjscalc: qjs
 	ln -sf $< $@
@@ -312,7 +304,7 @@ libunicode-table.h: unicode_gen
 endif
 
 run-test262: $(OBJDIR)/run-test262.o $(QJS_LIB_OBJS)
-	$(CC) $(LDFLAGS) $(LDEXTRAS) -o $@ $^ $(LIBS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 run-test262-debug: $(patsubst %.o, %.debug.o, $(OBJDIR)/run-test262.o $(QJS_LIB_OBJS))
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
@@ -387,13 +379,11 @@ hello.c: $(QJSC) $(HELLO_SRCS)
 	$(QJSC) -e $(HELLO_OPTS) -o $@ $(HELLO_SRCS)
 
 ifdef CONFIG_M32
-ifndef CONFIG_WIN32
 examples/hello: $(OBJDIR)/hello.m32s.o $(patsubst %.o, %.m32s.o, $(QJS_LIB_OBJS))
 	$(CC) -m32 $(LDFLAGS) -o $@ $^ $(LIBS)
 else
 examples/hello: $(OBJDIR)/hello.o $(QJS_LIB_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
-endif
 endif
 
 # example of static JS compilation with modules
@@ -444,9 +434,7 @@ ifdef CONFIG_SHARED_LIBS
 test: tests/bjson.so examples/point.so
 endif
 ifdef CONFIG_M32
-ifndef CONFIG_WIN32
 test: qjs32
-endif
 endif
 
 test: qjs
@@ -471,7 +459,6 @@ ifdef CONFIG_BIGNUM
 	./qjs --qjscalc tests/test_qjscalc.js
 endif
 ifdef CONFIG_M32
-ifndef CONFIG_WIN32
 	./qjs32 tests/test_closure.js
 	./qjs32 tests/test_language.js
 	./qjs32 --std tests/test_builtin.js
@@ -483,7 +470,6 @@ ifdef CONFIG_BIGNUM
 	./qjs32 --bignum tests/test_op_overloading.js
 	./qjs32 --bignum tests/test_bigfloat.js
 	./qjs32 --qjscalc tests/test_qjscalc.js
-endif
 endif
 endif
 

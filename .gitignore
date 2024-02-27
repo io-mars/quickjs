@@ -7,6 +7,7 @@ out*.c
 build.log
 include/**
 quickjs-*.zip
+build/**
 
 *.a
 .obj/
