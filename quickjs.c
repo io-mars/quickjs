@@ -11084,6 +11084,8 @@ static __exception int JS_ToArrayLengthFree(JSContext *ctx, uint32_t *plen,
         if (JS_TAG_IS_FLOAT64(tag)) {
             double d;
             d = JS_VALUE_GET_FLOAT64(val);
+            if (!(d >= 0 && d <= UINT32_MAX))
+                goto fail;
             len = (uint32_t)d;
             if (len != d)
                 goto fail;
@@ -11334,6 +11336,8 @@ static JSValue js_bigdecimal_to_string(JSContext *ctx, JSValueConst val)
 #endif /* CONFIG_BIGNUM */
 
 /* 2 <= base <= 36 */
+static char const digits[36] = "0123456789abcdefghijklmnopqrstuvwxyz";
+
 static char *i64toa(char *buf_end, int64_t n, unsigned int base)
 {
     char *q = buf_end;
@@ -11345,15 +11349,20 @@ static char *i64toa(char *buf_end, int64_t n, unsigned int base)
         n = -n;
     }
     *--q = '\0';
-    do {
-        digit = (uint64_t)n % base;
-        n = (uint64_t)n / base;
-        if (digit < 10)
-            digit += '0';
-        else
-            digit += 'a' - 10;
-        *--q = digit;
-    } while (n != 0);
+    if (base == 10) {
+        /* division by known base uses multiplication */
+        do {
+            digit = (uint64_t)n % 10;
+            n = (uint64_t)n / 10;
+            *--q = '0' + digit;
+        } while (n != 0);
+    } else {
+        do {
+            digit = (uint64_t)n % base;
+            n = (uint64_t)n / base;
+            *--q = digits[digit];
+        } while (n != 0);
+    }
     if (is_neg)
         *--q = '-';
     return q;
@@ -11599,6 +11608,80 @@ static JSValue js_dtoa(JSContext *ctx,
     char buf[JS_DTOA_BUF_SIZE];
     js_dtoa1(&buf, d, radix, n_digits, flags);
     return JS_NewString(ctx, buf);
+}
+
+static JSValue js_dtoa_radix(JSContext *ctx, double d, int radix)
+{
+    char buf[2200], *ptr, *ptr2;
+    /* d is finite */
+    int sign = d < 0;
+    int digit;
+    double frac, d0;
+    int64_t n0 = 0;
+    d = fabs(d);
+    d0 = trunc(d);
+    frac = d - d0;
+    ptr = buf + 1100;
+    *ptr = '\0';
+    if (d0 <= MAX_SAFE_INTEGER) {
+        int64_t n = n0 = (int64_t)d0;
+        while (n >= radix) {
+            digit = n % radix;
+            n = n / radix;
+            *--ptr = digits[digit];
+        }
+        *--ptr = digits[(int)n];
+    } else {
+        /* no decimals */
+        while (d0 >= radix) {
+            digit = fmod(d0, radix);
+            d0 = trunc(d0 / radix);
+            if (d0 >= MAX_SAFE_INTEGER)
+                digit = 0;
+            *--ptr = digits[digit];
+        }
+        *--ptr = digits[(int)d0];
+        goto done;
+    }
+    if (frac != 0) {
+        double log2_radix = log2(radix);
+        double prec = 1023 + 51;  // handle subnormals
+        ptr2 = buf + 1100;
+        *ptr2++ = '.';
+        while (frac != 0 && n0 <= MAX_SAFE_INTEGER/2 && prec > 0) {
+            frac *= radix;
+            digit = trunc(frac);
+            frac -= digit;
+            *ptr2++ = digits[digit];
+            n0 = n0 * radix + digit;
+            prec -= log2_radix;
+        }
+        *ptr2 = '\0';
+        if (frac * radix >= radix / 2) {
+            char nine = digits[radix - 1];
+            // round to closest
+            while (ptr2[-1] == nine)
+                *--ptr2 = '\0';
+            if (ptr2[-1] == '.') {
+                *--ptr2 = '\0';
+                while (ptr2[-1] == nine)
+                    *--ptr2 = '0';
+            }
+            if (ptr2 - 1 == ptr)
+                *--ptr = '1';
+            else
+                ptr2[-1] += 1;
+        } else {
+            while (ptr2[-1] == '0')
+                *--ptr2 = '\0';
+            if (ptr2[-1] == '.')
+                *--ptr2 = '\0';
+        }
+    }
+done:
+    ptr[-1] = '-';
+    ptr -= sign;
+    return JS_NewString(ctx, ptr);
 }
 
 JSValue JS_ToStringInternal(JSContext *ctx, JSValueConst val, BOOL is_ToPropertyKey)
@@ -33313,8 +33396,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
             }
         } else {
             b->vardefs = (void *)((uint8_t*)b + vardefs_offset);
-            memcpy(b->vardefs, fd->args, fd->arg_count * sizeof(fd->args[0]));
-            memcpy(b->vardefs + fd->arg_count, fd->vars, fd->var_count * sizeof(fd->vars[0]));
+            memcpy_no_ub(b->vardefs, fd->args, fd->arg_count * sizeof(fd->args[0]));
+            memcpy_no_ub(b->vardefs + fd->arg_count, fd->vars, fd->var_count * sizeof(fd->vars[0]));
         }
         b->var_count = fd->var_count;
         b->arg_count = fd->arg_count;
@@ -40981,8 +41064,16 @@ static JSValue js_number_toString(JSContext *ctx, JSValueConst this_val,
         if (base < 0)
             goto fail;
     }
+    if (JS_VALUE_GET_TAG(val) == JS_TAG_INT) {
+        char buf1[70], *ptr;
+        ptr = i64toa(buf1 + sizeof(buf1), JS_VALUE_GET_INT(val), base);
+        return JS_NewString(ctx, ptr);
+    }
     if (JS_ToFloat64Free(ctx, &d, val))
         return JS_EXCEPTION;
+    if (base != 10 && isfinite(d)) {
+        return js_dtoa_radix(ctx, d, base);
+    }
     return js_dtoa(ctx, d, base, 0, JS_DTOA_VAR_FORMAT);
  fail:
     JS_FreeValue(ctx, val);
@@ -49803,23 +49894,28 @@ static BOOL string_skip_char(const uint8_t *sp, int *pp, int c) {
     }
 }
 
-/* skip spaces, update offset */
-static void string_skip_spaces(const uint8_t *sp, int *pp) {
-    while (sp[*pp] == ' ')
+/* skip spaces, update offset, return next char */
+static int string_skip_spaces(const uint8_t *sp, int *pp) {
+    int c;
+    while ((c = sp[*pp]) == ' ')
         *pp += 1;
+    return c;
 }
 
 /* skip dashes dots and commas */
-static void string_skip_separators(const uint8_t *sp, int *pp) {
+static int string_skip_separators(const uint8_t *sp, int *pp) {
     int c;
-    while ((c = sp[*pp]) == '-' || c == '.' || c == ',')
+    while ((c = sp[*pp]) == '-' || c == '/' || c == '.' || c == ',')
         *pp += 1;
+    return c;
 }
 
-/* skip non spaces, update offset */
-static void string_skip_non_spaces(const uint8_t *sp, int *pp) {
-    while (sp[*pp] != '\0' && sp[*pp] != ' ')
+/* skip a word, stop on spaces, digits and separators, update offset */
+static int string_skip_until(const uint8_t *sp, int *pp, const char *stoplist) {
+    int c;
+    while (!strchr(stoplist, c = sp[*pp]))
         *pp += 1;
+    return c;
 }
 
 /* parse a numeric field (max_digits = 0 -> no maximum) */
@@ -49867,26 +49963,37 @@ static BOOL string_get_milliseconds(const uint8_t *sp, int *pp, int *pval) {
     return TRUE;
 }
 
-static BOOL string_get_timezone(const uint8_t *sp, int *pp, int *tzp) {
+static BOOL string_get_timezone(const uint8_t *sp, int *pp, int *tzp, BOOL strict) {
     int tz = 0, sgn, hh, mm, p = *pp;
 
-    sgn = sp[p];
+    sgn = sp[p++];
     if (sgn == '+' || sgn == '-') {
-        p++;
-        if (!string_get_digits(sp, &p, &hh, 2, 2))
+        int n = p;
+        if (!string_get_digits(sp, &p, &hh, 1, 9))
             return FALSE;
-        string_skip_char(sp, &p, ':');  /* optional separator */
-        if (!string_get_digits(sp, &p, &mm, 2, 2))
+        n = p - n;
+        if (strict && n != 2 && n != 4)
             return FALSE;
+        while (n > 4) {
+            n -= 2;
+            hh /= 100;
+        }
+        if (n > 2) {
+            mm = hh % 100;
+            hh = hh / 100;
+        } else {
+            mm = 0;
+            if (string_skip_char(sp, &p, ':')  /* optional separator */
+            &&  !string_get_digits(sp, &p, &mm, 2, 2))
+                return FALSE;
+        }
         if (hh > 23 || mm > 59)
             return FALSE;
         tz = hh * 60 + mm;
         if (sgn != '+')
             tz = -tz;
     } else
-    if (sgn == 'Z') {
-        p++;
-    } else {
+    if (sgn != 'Z') {
         return FALSE;
     }
     *pp = p;
@@ -49894,10 +50001,14 @@ static BOOL string_get_timezone(const uint8_t *sp, int *pp, int *tzp) {
     return TRUE;
 }
 
+static uint8_t upper_ascii(uint8_t c) {
+    return c >= 'a' && c <= 'z' ? c - 'a' + 'Z' : c;
+}
+
 static BOOL string_match(const uint8_t *sp, int *pp, const char *s) {
     int p = *pp;
     while (*s != '\0') {
-        if (sp[p] != (uint8_t)*s++)
+        if (upper_ascii(sp[p]) != upper_ascii(*s++))
             return FALSE;
         p++;
     }
@@ -49910,7 +50021,7 @@ static int find_abbrev(const uint8_t *sp, int p, const char *list, int count) {
 
     for (n = 0; n < count; n++) {
         for (i = 0;; i++) {
-            if (sp[p + i] != (uint8_t)month_names[n * 3 + i])
+            if (upper_ascii(sp[p + i]) != upper_ascii(list[n * 3 + i]))
                 break;
             if (i == 2)
                 return n;
@@ -49973,8 +50084,10 @@ static BOOL js_date_parse_isostring(const uint8_t *sp, int fields[9], BOOL *is_l
         *is_local = TRUE;
         if (!string_get_digits(sp, &p, &fields[3], 2, 2)  /* hour */
         ||  !string_skip_char(sp, &p, ':')
-        ||  !string_get_digits(sp, &p, &fields[4], 2, 2))  /* minute */
-            return FALSE;
+        ||  !string_get_digits(sp, &p, &fields[4], 2, 2)) {  /* minute */
+            fields[3] = 100;  // reject unconditionally
+            return TRUE;
+        }
         if (string_skip_char(sp, &p, ':')) {
             if (!string_get_digits(sp, &p, &fields[5], 2, 2))  /* second */
                 return FALSE;
@@ -49984,7 +50097,7 @@ static BOOL js_date_parse_isostring(const uint8_t *sp, int fields[9], BOOL *is_l
     /* parse the time zone offset if present: [+-]HH:mm or [+-]HHmm */
     if (sp[p]) {
         *is_local = FALSE;
-        if (!string_get_timezone(sp, &p, &fields[8]))
+        if (!string_get_timezone(sp, &p, &fields[8], TRUE))
             return FALSE;
     }
     /* error if extraneous characters */
@@ -50009,11 +50122,10 @@ static BOOL js_date_parse_otherstring(const uint8_t *sp, int fields[9], BOOL *is
     }
     *is_local = TRUE;
 
-    while (sp[p] != '\0') {
-        string_skip_spaces(sp, &p);
+    while (string_skip_spaces(sp, &p)) {
         p_start = p;
         if ((c = sp[p]) == '+' || c == '-') {
-            if (has_time && string_get_timezone(sp, &p, &fields[8])) {
+            if (has_time && string_get_timezone(sp, &p, &fields[8], FALSE)) {
                 *is_local = FALSE;
             } else {
                 p++;
@@ -50046,7 +50158,7 @@ static BOOL js_date_parse_otherstring(const uint8_t *sp, int fields[9], BOOL *is
                     has_year = TRUE;
                 } else
                 if (val < 1 || val > 31) {
-                    fields[0] = val + (val < 100) * 1900;
+                    fields[0] = val + (val < 100) * 1900 + (val < 50) * 100;
                     has_year = TRUE;
                 } else {
                     if (num_index == 3)
@@ -50057,19 +50169,73 @@ static BOOL js_date_parse_otherstring(const uint8_t *sp, int fields[9], BOOL *is
         } else
         if (string_get_month(sp, &p, &fields[1])) {
             has_mon = TRUE;
+            string_skip_until(sp, &p, "0123456789 -/(");
         } else
         if (c == 'Z') {
             *is_local = FALSE;
             p++;
             continue;
         } else
-        if (string_match(sp, &p, "GMT") || string_match(sp, &p, "UTC")) {
+        if (has_time && string_match(sp, &p, "PM")) {
+            if (fields[3] < 12)
+                fields[3] += 12;
+            continue;
+        } else
+        if (has_time && string_match(sp, &p, "AM")) {
+            if (fields[3] == 12)
+                fields[3] -= 12;
+            continue;
+        } else
+        if (string_match(sp, &p, "GMT")
+        ||  string_match(sp, &p, "UTC")
+        ||  string_match(sp, &p, "UT")) {
             *is_local = FALSE;
             continue;
-        } else {
-            /* skip a word */
-            string_skip_non_spaces(sp, &p);
+        } else
+        if (string_match(sp, &p, "EDT")) {
+            fields[8] = -4 * 60;
+            *is_local = FALSE;
             continue;
+        } else
+        if (string_match(sp, &p, "EST") || string_match(sp, &p, "CDT")) {
+            fields[8] = -5 * 60;
+            *is_local = FALSE;
+            continue;
+        } else
+        if (string_match(sp, &p, "CST") || string_match(sp, &p, "MDT")) {
+            fields[8] = -6 * 60;
+            *is_local = FALSE;
+            continue;
+        } else
+        if (string_match(sp, &p, "MST") || string_match(sp, &p, "PDT")) {
+            fields[8] = -7 * 60;
+            *is_local = FALSE;
+            continue;
+        } else
+        if (string_match(sp, &p, "PST")) {
+            fields[8] = -8 * 60;
+            *is_local = FALSE;
+            continue;
+        } else
+        if (c == '(') {  /* skip parenthesized phrase */
+            int level = 0;
+            while ((c = sp[p]) != '\0') {
+                p++;
+                level += (c == '(');
+                level -= (c == ')');
+                if (!level)
+                    break;
+            }
+            if (level > 0)
+                return FALSE;
+        } else
+        if (c == ')') {
+            return FALSE;
+        } else {
+            if (has_year + has_mon + has_time + num_index)
+                return FALSE;
+            /* skip a word */
+            string_skip_until(sp, &p, " -/(");
         }
         string_skip_separators(sp, &p);
     }
@@ -50093,7 +50259,7 @@ static BOOL js_date_parse_otherstring(const uint8_t *sp, int fields[9], BOOL *is
             fields[2] = num[1];
         } else
         if (has_mon) {
-            fields[0] = num[1] + (num[1] < 100) * 1900;
+            fields[0] = num[1] + (num[1] < 100) * 1900 + (num[1] < 50) * 100;
             fields[2] = num[0];
         } else {
             fields[1] = num[0];
@@ -50101,7 +50267,7 @@ static BOOL js_date_parse_otherstring(const uint8_t *sp, int fields[9], BOOL *is
         }
         break;
     case 3:
-        fields[0] = num[2] + (num[2] < 100) * 1900;
+        fields[0] = num[2] + (num[2] < 100) * 1900 + (num[2] < 50) * 100;
         fields[1] = num[0];
         fields[2] = num[1];
         break;
@@ -53839,9 +54005,10 @@ static JSValue js_typed_array_indexOf(JSContext *ctx, JSValueConst this_val,
     } else
     if (tag == JS_TAG_FLOAT64) {
         d = JS_VALUE_GET_FLOAT64(argv[0]);
-        // XXX: should fix UB
-        v64 = d;
-        is_int = (v64 == d);
+        if (d >= INT64_MIN && d < 0x1p63) {
+            v64 = d;
+            is_int = (v64 == d);
+        }
     } else if (tag == JS_TAG_BIG_INT) {
         JSBigFloat *p1 = JS_VALUE_GET_PTR(argv[0]);
 
