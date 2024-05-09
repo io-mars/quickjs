@@ -6408,6 +6408,11 @@ JSValue JS_GetException(JSContext *ctx)
     return val;
 }
 
+JS_BOOL JS_HasException(JSContext *ctx)
+{
+    return !JS_IsNull(ctx->rt->current_exception);
+}
+
 static void dbuf_put_leb128(DynBuf *s, uint32_t v)
 {
     uint32_t a;
@@ -53397,6 +53402,16 @@ static JSValue js_typed_array_get_byteOffset(JSContext *ctx,
     }
     ta = p->u.typed_array;
     return JS_NewInt32(ctx, ta->offset);
+}
+
+JSValue JS_NewTypedArray(JSContext *ctx, int argc, JSValueConst *argv,
+                         JSTypedArrayEnum type)
+{
+    if (type < JS_TYPED_ARRAY_UINT8C || type > JS_TYPED_ARRAY_FLOAT64)
+        return JS_ThrowRangeError(ctx, "invalid typed array type");
+
+    return js_typed_array_constructor(ctx, JS_UNDEFINED, argc, argv,
+                                      JS_CLASS_UINT8C_ARRAY + type);
 }
 
 /* Return the buffer associated to the typed array or an exception if
