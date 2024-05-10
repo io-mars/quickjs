@@ -1132,7 +1132,7 @@ typedef enum JSStrictEqModeEnum {
 
 static BOOL js_strict_eq2(JSContext *ctx, JSValue op1, JSValue op2,
                           JSStrictEqModeEnum eq_mode);
-static BOOL js_strict_eq(JSContext *ctx, JSValue op1, JSValue op2);
+static BOOL js_strict_eq(JSContext *ctx, JSValueConst op1, JSValueConst op2);
 static BOOL js_same_value(JSContext *ctx, JSValueConst op1, JSValueConst op2);
 static BOOL js_same_value_zero(JSContext *ctx, JSValueConst op1, JSValueConst op2);
 static JSValue JS_ToObject(JSContext *ctx, JSValueConst val);
@@ -1175,9 +1175,10 @@ static JSValue JS_ThrowTypeErrorRevokedProxy(JSContext *ctx);
 static JSValue js_proxy_getPrototypeOf(JSContext *ctx, JSValueConst obj);
 static int js_proxy_setPrototypeOf(JSContext *ctx, JSValueConst obj,
                                    JSValueConst proto_val, BOOL throw_flag);
+
+static int js_resolve_proxy(JSContext *ctx, JSValueConst *pval, int throw_exception);
 static int js_proxy_isExtensible(JSContext *ctx, JSValueConst obj);
 static int js_proxy_preventExtensions(JSContext *ctx, JSValueConst obj);
-static int js_proxy_isArray(JSContext *ctx, JSValueConst obj);
 static int JS_CreateProperty(JSContext *ctx, JSObject *p,
                              JSAtom prop, JSValueConst val,
                              JSValueConst getter, JSValueConst setter,
@@ -1276,7 +1277,6 @@ static JSValue js_module_ns_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
                                  void *opaque);
 static JSValue JS_InstantiateFunctionListItem2(JSContext *ctx, JSObject *p,
                                                JSAtom atom, void *opaque);
-void JS_SetUncatchableError(JSContext *ctx, JSValueConst val, BOOL flag);
 static JSValue js_object_groupBy(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv, int is_map);
 
@@ -12116,15 +12116,14 @@ static __maybe_unused void JS_PrintValue(JSContext *ctx,
 }
 
 /* return -1 if exception (proxy case) or TRUE/FALSE */
+// TODO: should take flags to make proxy resolution and exceptions optional
 int JS_IsArray(JSContext *ctx, JSValueConst val)
 {
-    JSObject *p;
+    if (js_resolve_proxy(ctx, &val, TRUE))
+        return -1;
     if (JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT) {
-        p = JS_VALUE_GET_OBJ(val);
-        if (unlikely(p->class_id == JS_CLASS_PROXY))
-            return js_proxy_isArray(ctx, val);
-        else
-            return p->class_id == JS_CLASS_ARRAY;
+        JSObject *p = JS_VALUE_GET_OBJ(val);
+        return p->class_id == JS_CLASS_ARRAY;
     } else {
         return FALSE;
     }
@@ -14246,7 +14245,7 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
                 goto exception;
             }
         }
-        res = js_strict_eq(ctx, op1, op2);
+        res = js_strict_eq2(ctx, op1, op2, JS_EQ_STRICT);
     } else if (tag1 == JS_TAG_BOOL) {
         op1 = JS_NewInt32(ctx, JS_VALUE_GET_INT(op1));
         goto redo;
@@ -14564,9 +14563,16 @@ static BOOL js_strict_eq2(JSContext *ctx, JSValue op1, JSValue op2,
     return res;
 }
 
-static BOOL js_strict_eq(JSContext *ctx, JSValue op1, JSValue op2)
+static BOOL js_strict_eq(JSContext *ctx, JSValueConst op1, JSValueConst op2)
 {
-    return js_strict_eq2(ctx, op1, op2, JS_EQ_STRICT);
+    return js_strict_eq2(ctx,
+                         JS_DupValue(ctx, op1), JS_DupValue(ctx, op2),
+                         JS_EQ_STRICT);
+}
+
+BOOL JS_StrictEq(JSContext *ctx, JSValueConst op1, JSValueConst op2)
+{
+    return js_strict_eq(ctx, op1, op2);
 }
 
 static BOOL js_same_value(JSContext *ctx, JSValueConst op1, JSValueConst op2)
@@ -14576,6 +14582,11 @@ static BOOL js_same_value(JSContext *ctx, JSValueConst op1, JSValueConst op2)
                          JS_EQ_SAME_VALUE);
 }
 
+BOOL JS_SameValue(JSContext *ctx, JSValueConst op1, JSValueConst op2)
+{
+    return js_same_value(ctx, op1, op2);
+}
+
 static BOOL js_same_value_zero(JSContext *ctx, JSValueConst op1, JSValueConst op2)
 {
     return js_strict_eq2(ctx,
@@ -14583,11 +14594,16 @@ static BOOL js_same_value_zero(JSContext *ctx, JSValueConst op1, JSValueConst op
                          JS_EQ_SAME_VALUE_ZERO);
 }
 
+BOOL JS_SameValueZero(JSContext *ctx, JSValueConst op1, JSValueConst op2)
+{
+    return js_same_value_zero(ctx, op1, op2);
+}
+
 static no_inline int js_strict_eq_slow(JSContext *ctx, JSValue *sp,
                                        BOOL is_neq)
 {
     BOOL res;
-    res = js_strict_eq(ctx, sp[-2], sp[-1]);
+    res = js_strict_eq2(ctx, sp[-2], sp[-1], JS_EQ_STRICT);
     sp[-2] = JS_NewBool(ctx, res ^ is_neq);
     return 0;
 }
@@ -46703,20 +46719,35 @@ static JSValue js_proxy_call(JSContext *ctx, JSValueConst func_obj,
     return ret;
 }
 
-static int js_proxy_isArray(JSContext *ctx, JSValueConst obj)
-{
-    JSProxyData *s = JS_GetOpaque(obj, JS_CLASS_PROXY);
-    if (!s)
-        return FALSE;
-    if (js_check_stack_overflow(ctx->rt, 0)) {
-        JS_ThrowStackOverflow(ctx);
-        return -1;
+/* `js_resolve_proxy`: resolve the proxy chain
+   `*pval` is updated with to ultimate proxy target
+   `throw_exception` controls whether exceptions are thown or not
+   - return -1 in case of error
+   - otherwise return 0
+ */
+static int js_resolve_proxy(JSContext *ctx, JSValueConst *pval, BOOL throw_exception) {
+    int depth = 0;
+    JSObject *p;
+    JSProxyData *s;
+
+    while (JS_VALUE_GET_TAG(*pval) == JS_TAG_OBJECT) {
+        p = JS_VALUE_GET_OBJ(*pval);
+        if (p->class_id != JS_CLASS_PROXY)
+            break;
+        if (depth++ > 1000) {
+            if (throw_exception)
+                JS_ThrowStackOverflow(ctx);
+            return -1;
+        }
+        s = p->u.opaque;
+        if (s->is_revoked) {
+            if (throw_exception)
+                JS_ThrowTypeErrorRevokedProxy(ctx);
+            return -1;
+        }
+        *pval = s->target;
     }
-    if (s->is_revoked) {
-        JS_ThrowTypeErrorRevokedProxy(ctx);
-        return -1;
-    }
-    return JS_IsArray(ctx, s->target);
+    return 0;
 }
 
 static const JSClassExoticMethods js_proxy_exotic_methods = {
