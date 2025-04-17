@@ -3095,7 +3095,7 @@ static JSValue JS_AtomIsNumericIndex1(JSContext *ctx, JSAtom atom)
     JSRuntime *rt = ctx->rt;
     JSAtomStruct *p1;
     JSString *p;
-    int c, len, ret;
+    int c, ret;
     JSValue num, str;
 
     if (__JS_AtomIsTaggedInt(atom))
@@ -3104,52 +3104,24 @@ static JSValue JS_AtomIsNumericIndex1(JSContext *ctx, JSAtom atom)
     p1 = rt->atom_array[atom];
     if (p1->atom_type != JS_ATOM_TYPE_STRING)
         return JS_UNDEFINED;
-    p = p1;
-    len = p->len;
-    if (p->is_wide_char) {
-        const uint16_t *r = p->u.str16, *r_end = p->u.str16 + len;
-        if (r >= r_end)
-            return JS_UNDEFINED;
-        c = *r;
-        if (c == '-') {
-            if (r >= r_end)
-                return JS_UNDEFINED;
-            r++;
-            c = *r;
-            /* -0 case is specific */
-            if (c == '0' && len == 2)
-                goto minus_zero;
-        }
-        /* XXX: should test NaN, but the tests do not check it */
-        if (!is_num(c)) {
-            /* XXX: String should be normalized, therefore 8-bit only */
-            const uint16_t nfinity16[7] = { 'n', 'f', 'i', 'n', 'i', 't', 'y' };
-            if (!(c =='I' && (r_end - r) == 8 &&
-                  !memcmp(r + 1, nfinity16, sizeof(nfinity16))))
-                return JS_UNDEFINED;
-        }
-    } else {
-        const uint8_t *r = p->u.str8, *r_end = p->u.str8 + len;
-        if (r >= r_end)
-            return JS_UNDEFINED;
-        c = *r;
-        if (c == '-') {
-            if (r >= r_end)
-                return JS_UNDEFINED;
-            r++;
-            c = *r;
-            /* -0 case is specific */
-            if (c == '0' && len == 2) {
-            minus_zero:
-                return __JS_NewFloat64(ctx, -0.0);
-            }
-        }
-        if (!is_num(c)) {
-            if (!(c =='I' && (r_end - r) == 8 &&
-                  !memcmp(r + 1, "nfinity", 7)))
-                return JS_UNDEFINED;
-        }
+    switch(atom) {
+    case JS_ATOM_minus_zero:
+        return __JS_NewFloat64(ctx, -0.0);
+    case JS_ATOM_Infinity:
+        return __JS_NewFloat64(ctx, INFINITY);
+    case JS_ATOM_minus_Infinity:
+        return __JS_NewFloat64(ctx, -INFINITY);
+    case JS_ATOM_NaN:
+        return __JS_NewFloat64(ctx, NAN);
+    default:
+        break;
     }
+    p = p1;
+    if (p->len == 0)
+        return JS_UNDEFINED;
+    c = string_get(p, 0);
+    if (!is_num(c) && c != '-')
+        return JS_UNDEFINED;
     /* this is ECMA CanonicalNumericIndexString primitive */
     num = JS_ToNumber(ctx, JS_MKPTR(JS_TAG_STRING, p));
     if (JS_IsException(num))
@@ -8362,6 +8334,11 @@ static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
         }
     } else {
     slow_path:
+        /* ToObject() must be done before ToPropertyKey() */
+        if (JS_IsNull(this_obj) || JS_IsUndefined(this_obj)) {
+            JS_FreeValue(ctx, prop);
+            return JS_ThrowTypeError(ctx, "cannot read property of %s", JS_IsNull(this_obj) ? "null" : "undefined");
+        }
         atom = JS_ValueToAtom(ctx, prop);
         JS_FreeValue(ctx, prop);
         if (unlikely(atom == JS_ATOM_NULL))
@@ -10102,6 +10079,9 @@ static int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
         set_value(ctx, &pr->u.value, val);
         return 0;
     }
+    /* XXX: add a fast path where the property exists and the object
+       is not exotic. Otherwise do as in OP_put_ref_value and remove
+       JS_PROP_NO_ADD which is no longer necessary */
     flags = JS_PROP_THROW_STRICT;
     if (is_strict_mode(ctx))
         flags |= JS_PROP_NO_ADD;
@@ -17782,16 +17762,33 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_get_ref_value):
             {
                 JSValue val;
+                JSAtom atom;
+                int ret;
+                
+                atom = JS_ValueToAtom(ctx, sp[-1]);
+                if (atom == JS_ATOM_NULL)
+                    goto exception;
                 if (unlikely(JS_IsUndefined(sp[-2]))) {
-                    JSAtom atom = JS_ValueToAtom(ctx, sp[-1]);
-                    if (atom != JS_ATOM_NULL) {
-                        JS_ThrowReferenceErrorNotDefined(ctx, atom);
-                        JS_FreeAtom(ctx, atom);
-                    }
+                    JS_ThrowReferenceErrorNotDefined(ctx, atom);
+                    JS_FreeAtom(ctx, atom);
                     goto exception;
                 }
-                val = JS_GetPropertyValue(ctx, sp[-2],
-                                          JS_DupValue(ctx, sp[-1]));
+                ret = JS_HasProperty(ctx, sp[-2], atom);
+                if (unlikely(ret <= 0)) {
+                    if (ret < 0) {
+                        JS_FreeAtom(ctx, atom);
+                        goto exception;
+                    }
+                    if (is_strict_mode(ctx)) {
+                        JS_ThrowReferenceErrorNotDefined(ctx, atom);
+                        JS_FreeAtom(ctx, atom);
+                        goto exception;
+                    } 
+                    val = JS_UNDEFINED;
+                } else {
+                    val = JS_GetProperty(ctx, sp[-2], atom);
+                }
+                JS_FreeAtom(ctx, atom);
                 if (unlikely(JS_IsException(val)))
                     goto exception;
                 sp[0] = val;
@@ -17832,24 +17829,35 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_put_ref_value):
             {
-                int ret, flags;
-                flags = JS_PROP_THROW_STRICT;
+                int ret;
+                JSAtom atom;
+                atom = JS_ValueToAtom(ctx, sp[-2]);
+                if (unlikely(atom == JS_ATOM_NULL))
+                    goto exception;
                 if (unlikely(JS_IsUndefined(sp[-3]))) {
                     if (is_strict_mode(ctx)) {
-                        JSAtom atom = JS_ValueToAtom(ctx, sp[-2]);
-                        if (atom != JS_ATOM_NULL) {
-                            JS_ThrowReferenceErrorNotDefined(ctx, atom);
-                            JS_FreeAtom(ctx, atom);
-                        }
+                        JS_ThrowReferenceErrorNotDefined(ctx, atom);
+                        JS_FreeAtom(ctx, atom);
                         goto exception;
                     } else {
                         sp[-3] = JS_DupValue(ctx, ctx->global_obj);
                     }
-                } else {
-                    if (is_strict_mode(ctx))
-                        flags |= JS_PROP_NO_ADD;
                 }
-                ret = JS_SetPropertyValue(ctx, sp[-3], sp[-2], sp[-1], flags);
+                ret = JS_HasProperty(ctx, sp[-3], atom);
+                if (unlikely(ret <= 0)) {
+                    if (unlikely(ret < 0)) {
+                        JS_FreeAtom(ctx, atom);
+                        goto exception;
+                    }
+                    if (is_strict_mode(ctx)) {
+                        JS_ThrowReferenceErrorNotDefined(ctx, atom);
+                        JS_FreeAtom(ctx, atom);
+                        goto exception;
+                    }
+                }
+                ret = JS_SetPropertyInternal(ctx, sp[-3], atom, sp[-1], sp[-3], JS_PROP_THROW_STRICT);
+                JS_FreeAtom(ctx, atom);
+                JS_FreeValue(ctx, sp[-2]);
                 JS_FreeValue(ctx, sp[-3]);
                 sp -= 3;
                 if (unlikely(ret < 0))
@@ -18481,7 +18489,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_with_delete_var):
         CASE(OP_with_make_ref):
         CASE(OP_with_get_ref):
-        CASE(OP_with_get_ref_undef):
             {
                 JSAtom atom;
                 int32_t diff;
@@ -18506,13 +18513,34 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     }
                     switch (opcode) {
                     case OP_with_get_var:
-                        val = JS_GetProperty(ctx, obj, atom);
-                        if (unlikely(JS_IsException(val)))
-                            goto exception;
+                        /* in Object Environment Records, GetBindingValue() calls HasProperty() */
+                        ret = JS_HasProperty(ctx, obj, atom);
+                        if (unlikely(ret <= 0)) {
+                            if (ret < 0)
+                                goto exception;
+                            if (is_strict_mode(ctx)) {
+                                JS_ThrowReferenceErrorNotDefined(ctx, atom);
+                                goto exception;
+                            } 
+                            val = JS_UNDEFINED;
+                        } else {
+                            val = JS_GetProperty(ctx, obj, atom);
+                            if (unlikely(JS_IsException(val)))
+                                goto exception;
+                        }
                         set_value(ctx, &sp[-1], val);
                         break;
-                    case OP_with_put_var:
-                        /* XXX: check if strict mode */
+                    case OP_with_put_var: /* used e.g. in for in/of */
+                        /* in Object Environment Records, SetMutableBinding() calls HasProperty() */
+                        ret = JS_HasProperty(ctx, obj, atom);
+                        if (unlikely(ret <= 0)) {
+                            if (ret < 0)
+                                goto exception;
+                            if (is_strict_mode(ctx)) {
+                                JS_ThrowReferenceErrorNotDefined(ctx, atom);
+                                goto exception;
+                            } 
+                        }
                         ret = JS_SetPropertyInternal(ctx, obj, atom, sp[-2], obj,
                                                      JS_PROP_THROW_STRICT);
                         JS_FreeValue(ctx, sp[-1]);
@@ -18533,18 +18561,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         break;
                     case OP_with_get_ref:
                         /* produce a pair object/method on the stack */
-                        val = JS_GetProperty(ctx, obj, atom);
-                        if (unlikely(JS_IsException(val)))
+                        /* in Object Environment Records, GetBindingValue() calls HasProperty() */
+                        ret = JS_HasProperty(ctx, obj, atom);
+                        if (unlikely(ret < 0))
                             goto exception;
-                        *sp++ = val;
-                        break;
-                    case OP_with_get_ref_undef:
-                        /* produce a pair undefined/function on the stack */
-                        val = JS_GetProperty(ctx, obj, atom);
-                        if (unlikely(JS_IsException(val)))
-                            goto exception;
-                        JS_FreeValue(ctx, sp[-1]);
-                        sp[-1] = JS_UNDEFINED;
+                        if (!ret) {
+                            val = JS_UNDEFINED;
+                        } else {
+                            val = JS_GetProperty(ctx, obj, atom);
+                            if (unlikely(JS_IsException(val)))
+                                goto exception;
+                        }
                         *sp++ = val;
                         break;
                     }
@@ -22796,6 +22823,10 @@ static __exception int js_parse_object_literal(JSParseState *s)
             }
             emit_u8(s, op_flags | OP_DEFINE_METHOD_ENUMERABLE);
         } else {
+            if (name == JS_ATOM_NULL) {
+                /* must be done before evaluating expr */
+                emit_op(s, OP_to_propkey);
+            }
             if (js_parse_expect(s, ':'))
                 goto fail;
             if (js_parse_assign_expr(s))
@@ -23785,11 +23816,7 @@ static __exception int get_lvalue(JSParseState *s, int *popcode, int *pscope,
             update_label(fd, label, 1);
             opcode = OP_get_ref_value;
             break;
-        case OP_get_array_el:
-            emit_op(s, OP_to_propkey2);
-            break;
-        case OP_get_super_value:
-            emit_op(s, OP_to_propkey);
+        default:
             break;
         }
     }
@@ -24021,6 +24048,25 @@ duplicate:
     return js_parse_error(s, "duplicate parameter names not allowed in this context");
 }
 
+/* tok = TOK_VAR, TOK_LET or TOK_CONST. Return whether a reference
+   must be taken to the variable for proper 'with' or global variable
+   evaluation */
+/* Note: this function is needed only because variable references are
+   not yet optimized in destructuring */
+static BOOL need_var_reference(JSParseState *s, int tok)
+{
+    JSFunctionDef *fd = s->cur_func;
+    if (tok != TOK_VAR)
+        return FALSE; /* no reference for let/const */
+    if (fd->js_mode & JS_MODE_STRICT) {
+        if (!fd->is_global_var)
+            return FALSE; /* local definitions in strict mode in function or direct eval */
+        if (s->is_module)
+            return FALSE; /* in a module global variables are like closure variables */
+    }
+    return TRUE;
+}
+
 static JSAtom js_parse_destructuring_var(JSParseState *s, int tok, int is_arg)
 {
     JSAtom name;
@@ -24102,14 +24148,23 @@ static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
                     var_name = js_parse_destructuring_var(s, tok, is_arg);
                     if (var_name == JS_ATOM_NULL)
                         return -1;
-                    opcode = OP_scope_get_var;
-                    scope = s->cur_func->scope_level;
-                    label_lvalue = -1;
-                    depth_lvalue = 0;
+                    if (need_var_reference(s, tok)) {
+                        /* Must make a reference for proper `with` semantics */
+                        emit_op(s, OP_scope_get_var);
+                        emit_atom(s, var_name);
+                        emit_u16(s, s->cur_func->scope_level);
+                        JS_FreeAtom(s->ctx, var_name);
+                        goto lvalue0;
+                    } else {
+                        opcode = OP_scope_get_var;
+                        scope = s->cur_func->scope_level;
+                        label_lvalue = -1;
+                        depth_lvalue = 0;
+                    }
                 } else {
                     if (js_parse_left_hand_side_expr(s))
                         return -1;
-
+                lvalue0:
                     if (get_lvalue(s, &opcode, &scope, &var_name,
                                    &label_lvalue, &depth_lvalue, FALSE, '{'))
                         return -1;
@@ -24127,10 +24182,6 @@ static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
             if (prop_type < 0)
                 return -1;
             var_name = JS_ATOM_NULL;
-            opcode = OP_scope_get_var;
-            scope = s->cur_func->scope_level;
-            label_lvalue = -1;
-            depth_lvalue = 0;
             if (prop_type == PROP_TYPE_IDENT) {
                 if (next_token(s))
                     goto prop_error;
@@ -24199,10 +24250,24 @@ static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
                     var_name = js_parse_destructuring_var(s, tok, is_arg);
                     if (var_name == JS_ATOM_NULL)
                         goto prop_error;
+                    if (need_var_reference(s, tok)) {
+                        /* Must make a reference for proper `with` semantics */
+                        emit_op(s, OP_scope_get_var);
+                        emit_atom(s, var_name);
+                        emit_u16(s, s->cur_func->scope_level);
+                        JS_FreeAtom(s->ctx, var_name);
+                        goto lvalue1;
+                    } else {
+                        /* no need to make a reference for let/const */
+                        opcode = OP_scope_get_var;
+                        scope = s->cur_func->scope_level;
+                        label_lvalue = -1;
+                        depth_lvalue = 0;
+                    }
                 } else {
                     if (js_parse_left_hand_side_expr(s))
                         goto prop_error;
-                lvalue:
+                lvalue1:
                     if (get_lvalue(s, &opcode, &scope, &var_name,
                                    &label_lvalue, &depth_lvalue, FALSE, '{'))
                         goto prop_error;
@@ -24269,19 +24334,26 @@ static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
                     emit_atom(s, prop_name);
                     emit_op(s, OP_swap);
                 }
-                if (!tok || tok == TOK_VAR) {
+                if (!tok || need_var_reference(s, tok)) {
                     /* generate reference */
                     /* source -- source source */
                     emit_op(s, OP_dup);
                     emit_op(s, OP_scope_get_var);
                     emit_atom(s, prop_name);
                     emit_u16(s, s->cur_func->scope_level);
-                    goto lvalue;
+                    goto lvalue1;
+                } else {
+                    /* no need to make a reference for let/const */
+                    var_name = JS_DupAtom(s->ctx, prop_name);
+                    opcode = OP_scope_get_var;
+                    scope = s->cur_func->scope_level;
+                    label_lvalue = -1;
+                    depth_lvalue = 0;
+                    
+                    /* source -- source val */
+                    emit_op(s, OP_get_field2);
+                    emit_u32(s, prop_name);
                 }
-                var_name = JS_DupAtom(s->ctx, prop_name);
-                /* source -- source val */
-                emit_op(s, OP_get_field2);
-                emit_u32(s, prop_name);
             }
         set_val:
             if (tok) {
@@ -24292,7 +24364,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
                                           JS_EXPORT_TYPE_LOCAL))
                         goto var_error;
                 }
-                scope = s->cur_func->scope_level;
+                scope = s->cur_func->scope_level; /* XXX: check */
             }
             if (s->token.val == '=') {  /* handle optional default value */
                 int label_hasval;
@@ -24371,19 +24443,30 @@ static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
                     return -1;
             } else {
                 var_name = JS_ATOM_NULL;
-                enum_depth = 0;
                 if (tok) {
                     var_name = js_parse_destructuring_var(s, tok, is_arg);
                     if (var_name == JS_ATOM_NULL)
                         goto var_error;
                     if (js_define_var(s, var_name, tok))
                         goto var_error;
-                    opcode = OP_scope_get_var;
-                    scope = s->cur_func->scope_level;
-                    label_lvalue = -1;
+                    if (need_var_reference(s, tok)) {
+                        /* Must make a reference for proper `with` semantics */
+                        emit_op(s, OP_scope_get_var);
+                        emit_atom(s, var_name);
+                        emit_u16(s, s->cur_func->scope_level);
+                        JS_FreeAtom(s->ctx, var_name);
+                        goto lvalue2;
+                    } else {
+                        /* no need to make a reference for let/const */
+                        opcode = OP_scope_get_var;
+                        scope = s->cur_func->scope_level;
+                        label_lvalue = -1;
+                        enum_depth = 0;
+                    }
                 } else {
                     if (js_parse_left_hand_side_expr(s))
                         return -1;
+                lvalue2:
                     if (get_lvalue(s, &opcode, &scope, &var_name,
                                    &label_lvalue, &enum_depth, FALSE, '[')) {
                         return -1;
@@ -24655,20 +24738,12 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
         break;
     case '{':
     case '[':
-        {
-            int skip_bits;
-            if (js_parse_skip_parens_token(s, &skip_bits, FALSE) == '=') {
-                if (js_parse_destructuring_element(s, 0, 0, FALSE, skip_bits & SKIP_HAS_ELLIPSIS, TRUE, FALSE) < 0)
-                    return -1;
-            } else {
-                if (s->token.val == '{') {
-                    if (js_parse_object_literal(s))
-                        return -1;
-                } else {
-                    if (js_parse_array_literal(s))
-                        return -1;
-                }
-            }
+        if (s->token.val == '{') {
+            if (js_parse_object_literal(s))
+                return -1;
+        } else {
+            if (js_parse_array_literal(s))
+                return -1;
         }
         break;
     case TOK_NEW:
@@ -25641,7 +25716,7 @@ static __exception int js_parse_cond_expr(JSParseState *s, int parse_flags)
 /* allowed parse_flags: PF_IN_ACCEPTED */
 static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
 {
-    int opcode, op, scope;
+    int opcode, op, scope, skip_bits;
     JSAtom name0 = JS_ATOM_NULL;
     JSAtom name;
 
@@ -25818,6 +25893,11 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
         return js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
                                       JS_FUNC_NORMAL, JS_ATOM_NULL,
                                       s->token.ptr);
+    } else if ((s->token.val == '{' || s->token.val == '[') &&
+               js_parse_skip_parens_token(s, &skip_bits, FALSE) == '=') {
+        if (js_parse_destructuring_element(s, 0, 0, FALSE, skip_bits & SKIP_HAS_ELLIPSIS, TRUE, FALSE) < 0)
+            return -1;
+        return 0;
     }
  next:
     if (s->token.val == TOK_IDENT) {
@@ -26174,7 +26254,7 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
             if (s->token.val == '=') {
                 if (next_token(s))
                     goto var_error;
-                if (tok == TOK_VAR) {
+                if (need_var_reference(s, tok)) {
                     /* Must make a reference for proper `with` semantics */
                     int opcode, scope, label;
                     JSAtom name1;
@@ -32506,7 +32586,6 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         case OP_with_delete_var:
         case OP_with_make_ref:
         case OP_with_get_ref:
-        case OP_with_get_ref_undef:
             {
                 JSAtom atom;
                 int is_with;
@@ -33281,7 +33360,6 @@ static __exception int compute_stack_size(JSContext *ctx,
             break;
         case OP_with_make_ref:
         case OP_with_get_ref:
-        case OP_with_get_ref_undef:
             diff = get_u32(bc_buf + pos + 5);
             if (ss_check(ctx, s, pos + 5 + diff, op, stack_len + 2, catch_pos))
                 goto fail;
@@ -41351,7 +41429,9 @@ static JSValue js_string_constructor(JSContext *ctx, JSValueConst new_target,
         JSString *p1 = JS_VALUE_GET_STRING(val);
 
         obj = js_create_from_ctor(ctx, new_target, JS_CLASS_STRING);
-        if (!JS_IsException(obj)) {
+        if (JS_IsException(obj)) {
+            JS_FreeValue(ctx, val);
+        } else {
             JS_SetObjectData(ctx, obj, val);
             JS_DefinePropertyValue(ctx, obj, JS_ATOM_length, JS_NewInt32(ctx, p1->len), 0);
         }
@@ -46256,6 +46336,14 @@ static int js_proxy_get_own_property(JSContext *ctx, JSPropertyDescriptor *pdesc
         if (res < 0)
             return -1;
 
+        /* convert the result_desc.flags to property flags */
+        if (result_desc.flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) {
+            result_desc.flags |= JS_PROP_GETSET;
+        } else {
+            result_desc.flags |= JS_PROP_NORMAL;
+        }
+        result_desc.flags &= (JS_PROP_C_W_E | JS_PROP_TMASK);
+        
         if (target_desc_ret) {
             /* convert result_desc.flags to defineProperty flags */
             flags1 = result_desc.flags | JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_ENUMERABLE;
@@ -51060,6 +51148,7 @@ void JS_AddIntrinsicBaseObjects(JSContext *ctx)
     {
         /* initialize Array.prototype[Symbol.unscopables] */
         static const char unscopables[] =
+            "at" "\0"
             "copyWithin" "\0"
             "entries" "\0"
             "fill" "\0"
