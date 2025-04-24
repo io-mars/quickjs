@@ -1714,6 +1714,12 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
     rt->interrupt_opaque = opaque;
 }
 
+/* iomars */
+void JS_TriggerInterruptHandler(JSContext *ctx)
+{
+   ctx->interrupt_counter = 0;
+}
+
 void JS_SetCanBlock(JSRuntime *rt, BOOL can_block)
 {
     rt->can_block = can_block;

@@ -29,3 +29,14 @@ unicode_gen
 run_octane
 run_sunspider_like
 libwinpthread*.dll
+
+*.exe*
+*.lib
+*.dll
+*.s
+*.o
+out*.c
+build.log
+include/**
+quickjs-*.zip
+build/**
